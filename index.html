@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <meta name="theme-color" content="#050807">
+  <title>RF Emitter Highlighter XR</title>
+
+  <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+
+  <script>
+  /* =====================================================================
+     ONE-LINE TOGGLE — change this to switch how the scene renders:
+       'auto' : show both Enter VR + Enter AR buttons; the environment
+                adapts to whichever session you start (recommended).
+       'vr'   : dark virtual world (desktop / Quest Link iteration).
+       'ar'   : strip the world, transparent passthrough (standalone Quest Browser).
+     ===================================================================== */
+  const CONFIG = { mode: 'auto', bgColor: '#050807', fogDensity: 0.012, gazeFar: 120 };
+
+  /* Emitter feed. Swap this array for live base-station messages later —
+     the render layer never changes, only this source. */
+  const EMITTERS = [
+    { id:'EMT-007', cls:'DRONE CONTROLLER', color:'#2dffa0', confidence:0.79, speed:1.4, heading:'124\u00b0 SE', position:'14 0 -22' },
+    { id:'EMT-013', cls:'ENEMY DRONE',      color:'#ff5252', confidence:0.88, speed:7.3, heading:'299\u00b0 NW', position:'-30 0 -30' },
+    { id:'EMT-021', cls:'WALKIE TALKIE',    color:'#5a82ff', confidence:0.64, speed:0.7, heading:'34\u00b0 NE',  position:'40 0 -8' },
+    { id:'EMT-031', cls:'ENEMY DRONE',      color:'#ff5252', confidence:0.81, speed:5.4, heading:'153\u00b0 SE', position:'-10 0 26' }
+  ];
+
+  /* ---- Highlighter marker. All geometry is real XR scene content. ---- */
+  AFRAME.registerComponent('rf-emitter', {
+    schema: {
+      id:{default:'EMT-000'}, cls:{default:'UNKNOWN'}, color:{type:'color', default:'#2dffa0'},
+      confidence:{type:'number', default:0.8}, speed:{type:'number', default:0},
+      range:{type:'number', default:0}, heading:{default:'0\u00b0 N'}
+    },
+    init: function () {
+      const d = this.data, el = this.el, c = d.color;
+      el.innerHTML =
+        `<a-cylinder class="beam" position="0 15 0" radius="0.28" height="30" color="${c}"
+           material="shader:flat; transparent:true; opacity:0.16; blending:additive; depthWrite:false; fog:false"></a-cylinder>
+         <a-cylinder class="core" position="0 15 0" radius="0.045" height="30" color="${c}"
+           material="shader:flat; transparent:true; opacity:0.75; blending:additive; depthWrite:false; fog:false"></a-cylinder>
+         <a-ring position="0 0.03 0" rotation="-90 0 0" radius-inner="1.25" radius-outer="1.55" color="${c}"
+           material="shader:flat; side:double; transparent:true; opacity:0.9; fog:false"></a-ring>
+         <a-ring class="pulse" position="0 0.04 0" rotation="-90 0 0" radius-inner="0.8" radius-outer="1.05" color="${c}"
+           material="shader:flat; side:double; transparent:true; opacity:0.7; depthWrite:false; fog:false"></a-ring>
+         <a-sphere class="target" position="0 2.8 0" radius="0.55" color="${c}" material="shader:flat; fog:false"></a-sphere>
+         <a-entity class="tag billboard" position="0 4.0 0">
+           <a-plane width="2.8" height="0.55" color="#04100c" material="shader:flat; transparent:true; opacity:0.82; fog:false"></a-plane>
+           <a-text value="${d.id}" align="center" color="${c}" width="5.2" position="0 0 0.01"></a-text>
+         </a-entity>
+         <a-entity class="info billboard" visible="false" position="2.6 3.2 0">
+           <a-plane width="4.8" height="3.1" color="#04100c" material="shader:flat; transparent:true; opacity:0.94; fog:false"></a-plane>
+           <a-text value="${d.id}     ${Math.round(d.confidence*100)}%" color="${c}" width="5.1" position="-2.15 1.15 0.02"></a-text>
+           <a-text width="4.3" color="#dfeee8" position="-2.15 0.72 0.02"
+             value="CLASS\n${d.cls}\n\nSPEED\n${d.speed.toFixed(1)} m/s\n\nRANGE\n${d.range.toFixed(0)} m\n\nDIRECTION\n${d.heading}"></a-text>
+         </a-entity>`;
+
+      this.infoEl  = el.querySelector('.info');
+      this.beamEl  = el.querySelector('.beam');
+      this.coreEl  = el.querySelector('.core');
+      this.pulseEl = el.querySelector('.pulse');
+      this.phase = Math.random() * 1800;
+
+      this.onEnter = () => this.setFocused(true);
+      this.onLeave = () => this.setFocused(false);
+      el.addEventListener('mouseenter', this.onEnter);
+      el.addEventListener('mouseleave', this.onLeave);
+    },
+
+    remove: function () {
+      this.el.removeEventListener('mouseenter', this.onEnter);
+      this.el.removeEventListener('mouseleave', this.onLeave);
+    },
+
+    /* Write straight to three.js materials — no per-frame setAttribute. */
+    setFocused: function (f) {
+      this.infoEl.object3D.visible = f;
+      const bm = this.beamMesh || (this.beamMesh = this.beamEl.getObject3D('mesh'));
+      const cm = this.coreMesh || (this.coreMesh = this.coreEl.getObject3D('mesh'));
+      if (bm) bm.material.opacity = f ? 0.36 : 0.16;
+      if (cm) cm.material.opacity = f ? 1.0 : 0.75;
+    },
+
+    tick: function (time) {
+      const pm = this.pulseMesh || (this.pulseMesh = this.pulseEl.getObject3D('mesh'));
+      if (!pm) return;
+      const s = 1 + ((time + this.phase) % 1800) / 1800 * 4;
+      this.pulseEl.object3D.scale.set(s, s, s);
+      pm.material.opacity = 0.7 * (1 - (s - 1) / 4);
+    }
+  });
+
+  /* ---- Billboarding: cache the node list + one scratch vector.
+          No per-frame DOM query, no per-frame allocation. ---- */
+  AFRAME.registerComponent('billboard-system', {
+    init: function () {
+      this.list = [];
+      this.tmp = new THREE.Vector3();
+      this.refresh = this.refresh.bind(this);
+      this.el.addEventListener('loaded', this.refresh);
+      this.el.addEventListener('billboard-refresh', this.refresh);
+    },
+    refresh: function () {
+      this.list = Array.prototype.map.call(
+        this.el.querySelectorAll('.billboard'), n => n.object3D);
+    },
+    tick: function () {
+      const cam = this.el.camera;
+      if (!cam || !this.list.length) return;
+      cam.getWorldPosition(this.tmp);
+      for (let i = 0; i < this.list.length; i++) {
+        const o = this.list[i];
+        if (o.visible) o.lookAt(this.tmp);
+      }
+    }
+  });
+
+  /* ---- Real grid (A-Frame has no <a-grid-helper> primitive). ---- */
+  AFRAME.registerComponent('tactical-grid', {
+    schema: { size:{default:300}, divisions:{default:120},
+              c1:{type:'color', default:'#1c6a4f'}, c2:{type:'color', default:'#0c2f23'} },
+    init: function () {
+      const d = this.data;
+      const g = new THREE.GridHelper(d.size, d.divisions, new THREE.Color(d.c1), new THREE.Color(d.c2));
+      g.material.transparent = true;
+      g.material.opacity = 0.5;
+      g.material.depthWrite = false;
+      this.el.setObject3D('grid', g);
+    },
+    remove: function () { this.el.removeObject3D('grid'); }
+  });
+
+  /* ---- VR world vs AR passthrough. Strips ground/grid/fog/background
+          and clears alpha to 0 for passthrough. ---- */
+  AFRAME.registerComponent('environment-mode', {
+    init: function () {
+      this.sceneObj = this.el.object3D;
+      this.bgColor = new THREE.Color(CONFIG.bgColor);
+      this.fog = new THREE.FogExp2(this.bgColor.getHex(), CONFIG.fogDensity);
+
+      this.apply(CONFIG.mode === 'ar');
+
+      this.el.addEventListener('enter-vr', () => {
+        document.body.classList.add('in-xr');
+        const isAR = CONFIG.mode === 'ar' ? true
+                   : CONFIG.mode === 'vr' ? false
+                   : this.el.is('ar-mode');
+        this.apply(isAR);
+      });
+      this.el.addEventListener('exit-vr', () => {
+        document.body.classList.remove('in-xr');
+        this.apply(CONFIG.mode === 'ar');
+      });
+    },
+    apply: function (isAR) {
+      const ground = this.el.querySelector('#ground');
+      const grid   = this.el.querySelector('#grid');
+      if (ground) ground.setAttribute('visible', !isAR);
+      if (grid)   grid.setAttribute('visible', !isAR);
+      this.sceneObj.background = isAR ? null : this.bgColor;
+      this.sceneObj.fog = isAR ? null : this.fog;
+      const r = this.el.renderer;
+      if (r) r.setClearAlpha(isAR ? 0 : 1);
+    }
+  });
+
+  /* ---- Build markers from EMITTERS (single source; feed-ready). ---- */
+  AFRAME.registerComponent('emitter-source', {
+    init: function () {
+      EMITTERS.forEach(e => {
+        const p = e.position.split(' ').map(Number);
+        const el = document.createElement('a-entity');
+        el.setAttribute('position', e.position);
+        el.setAttribute('rf-emitter', {
+          id: e.id, cls: e.cls, color: e.color, confidence: e.confidence,
+          speed: e.speed, heading: e.heading,
+          range: Math.round(Math.hypot(p[0], p[2]))
+        });
+        this.el.appendChild(el);
+      });
+      const bump = () => this.el.emit('billboard-refresh');
+      this.el.addEventListener('loaded', bump);
+      setTimeout(bump, 800);
+    }
+  });
+  </script>
+
+  <style>
+    html,body{margin:0;width:100%;height:100%;background:#050807;font-family:monospace}
+    .web-note{position:fixed;left:16px;top:16px;z-index:5;color:#2dffa0;background:rgba(4,16,12,.84);
+      border:1px solid rgba(45,255,160,.35);padding:10px 12px;border-radius:7px;pointer-events:none}
+    .web-note small{display:block;color:#7fae9c;margin-top:4px}
+    .in-xr .web-note{display:none}
+  </style>
+</head>
+
+<body>
+  <div class="web-note">
+    RF EMITTER HIGHLIGHTER XR
+    <small>Desktop: drag to look &middot; Headset: Enter VR / Enter AR &middot; Gaze a marker to inspect</small>
+  </div>
+
+  <a-scene
+    vr-mode-ui="enabled: true"
+    webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking"
+    renderer="antialias: true; foveationLevel: 1"
+    environment-mode
+    billboard-system
+    emitter-source>
+
+    <a-entity light="type: ambient; color: #668877; intensity: 0.8"></a-entity>
+    <a-entity light="type: directional; color: #aaffdd; intensity: 0.35" position="-2 8 4"></a-entity>
+
+    <a-plane id="ground" rotation="-90 0 0" width="300" height="300" color="#07110d" material="shader:flat"></a-plane>
+    <a-entity id="grid" tactical-grid></a-entity>
+
+    <a-entity id="rig" position="0 0 0">
+      <a-camera id="head" position="0 1.7 0" look-controls="pointerLockEnabled: false" wasd-controls="enabled: false">
+        <a-ring id="reticle" position="0 0 -1.5" radius-inner="0.008" radius-outer="0.013" color="#2dffa0"
+          material="shader:flat"
+          cursor="rayOrigin: entity; fuse: false"
+          raycaster="objects: .target; far: 120"></a-ring>
+
+        <a-entity position="-0.62 0.38 -1.5">
+          <a-plane width="0.72" height="0.22" color="#04100c" material="shader:flat; transparent:true; opacity:0.72"></a-plane>
+          <a-text value="RF EMITTER HIGHLIGHTER" color="#2dffa0" width="1.05" position="-0.33 0.035 0.01"></a-text>
+          <a-text value="GAZE TO INSPECT" color="#39e0ff" width="0.82" position="-0.33 -0.055 0.01"></a-text>
+        </a-entity>
+      </a-camera>
+
+      <a-entity laser-controls="hand: left"  raycaster="objects: .target; far: 120"></a-entity>
+      <a-entity laser-controls="hand: right" raycaster="objects: .target; far: 120"></a-entity>
+    </a-entity>
+  </a-scene>
+</body>
+</html>
