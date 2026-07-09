@@ -341,30 +341,54 @@ AFRAME.registerComponent('control-panel', {
   }
 });
 
-/* ---------- environment: VR world vs AR passthrough ---------- */
+/* ---------- environment: VR world vs AR passthrough ----------
+   Detects AR from the live XR session's environmentBlendMode, which is
+   authoritative. A-Frame's 'ar-mode' state can lag the enter-vr event. */
 AFRAME.registerComponent('environment-mode', {
   init: function () {
     const self = this;
     this.bgc = new THREE.Color(CONFIG.bg);
     this.fog = new THREE.FogExp2(this.bgc.getHex(), CONFIG.fogDensity);
     this.apply(CONFIG.mode === 'ar');
+
     this.el.addEventListener('enter-vr', function () {
       document.body.classList.add('in-xr');
-      const isAR = CONFIG.mode==='ar' ? true : CONFIG.mode==='vr' ? false : self.el.is('ar-mode');
-      self.apply(isAR);
+      self.apply(self.detectAR());
+      // some runtimes populate the session a tick late
+      setTimeout(function () { self.apply(self.detectAR()); }, 100);
     });
     this.el.addEventListener('exit-vr', function () {
       document.body.classList.remove('in-xr');
       self.apply(CONFIG.mode === 'ar');
     });
   },
+
+  detectAR: function () {
+    if (CONFIG.mode === 'ar') return true;
+    if (CONFIG.mode === 'vr') return false;
+    const sess = this.el.renderer && this.el.renderer.xr && this.el.renderer.xr.getSession
+      ? this.el.renderer.xr.getSession() : null;
+    if (sess) {
+      // 'additive' or 'alpha-blend' => the real world is showing through
+      const m = sess.environmentBlendMode;
+      if (m === 'additive' || m === 'alpha-blend') return true;
+      if (m === 'opaque') return false;
+    }
+    return !!this.el.is('ar-mode');
+  },
+
   apply: function (isAR) {
     const g = this.el.querySelector('#ground'), gr = this.el.querySelector('#grid');
     if (g)  g.setAttribute('visible', !isAR);
     if (gr) gr.setAttribute('visible', !isAR);
     this.el.object3D.background = isAR ? null : this.bgc;
     this.el.object3D.fog        = isAR ? null : this.fog;
-    if (this.el.renderer) this.el.renderer.setClearAlpha(isAR ? 0 : 1);
+    const r = this.el.renderer;
+    if (r) {
+      r.setClearColor(isAR ? 0x000000 : this.bgc.getHex(), isAR ? 0 : 1);
+      r.setClearAlpha(isAR ? 0 : 1);
+    }
+    document.body.style.background = isAR ? 'transparent' : CONFIG.bg;
   }
 });
 
@@ -407,12 +431,42 @@ AFRAME.registerComponent('emitter-source', {
 <div class="note">
   RF EMITTER HIGHLIGHTER XR
   <small>Desktop: drag to look &middot; Headset: Enter AR / Enter VR<br>Gaze an orb to inspect &middot; Point &amp; trigger the panel</small>
+  <small id="xrdiag" style="margin-top:8px;border-top:1px solid rgba(45,255,160,.25);padding-top:6px">
+    checking XR support&hellip;</small>
 </div>
+
+<script>
+/* Capability probe: tells you BEFORE you put the headset on whether this
+   browser/session can do passthrough AR at all. */
+(function () {
+  const out = document.getElementById('xrdiag');
+  const say = (msg, ok) => {
+    out.innerHTML = msg;
+    out.style.color = ok ? '#2dffa0' : '#ffb454';
+  };
+  if (!navigator.xr) {
+    say('navigator.xr MISSING<br>not a WebXR browser (or insecure origin)', false);
+    return;
+  }
+  Promise.all([
+    navigator.xr.isSessionSupported('immersive-ar').catch(() => false),
+    navigator.xr.isSessionSupported('immersive-vr').catch(() => false)
+  ]).then(([ar, vr]) => {
+    say(
+      'immersive-ar: <b>' + (ar ? 'YES' : 'NO') + '</b><br>' +
+      'immersive-vr: <b>' + (vr ? 'YES' : 'NO') + '</b><br>' +
+      (ar ? 'press ENTER AR for passthrough'
+          : 'no passthrough &mdash; not Quest Browser, or running over Link'),
+      ar
+    );
+  });
+})();
+</script>
 
 <a-scene
   vr-mode-ui="enabled: true"
   webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking"
-  renderer="antialias: true; foveationLevel: 1; colorManagement: true"
+  renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
   environment-mode gaze-picker emitter-source>
 
   <a-entity light="type: ambient; color:#668877; intensity:0.9"></a-entity>
