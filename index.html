@@ -8,10 +8,9 @@
 <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
 <script>
 /* ============================================================
-   RF Emitter Highlighter — explicit immersive-ar (passthrough).
-   AR passthrough only works in the STANDALONE Meta Quest Browser.
-   Over Quest Link / Air Link the session is opaque VR and
-   immersive-ar reports false (Meta's own docs).
+   RF Emitter Highlighter — passthrough + anchored world.
+   Emitters live under #world, which is locked to a WebXR anchor
+   so they stay welded to real locations as the user walks.
    ============================================================ */
 const CONFIG = { bg:'#050807', fogDensity:0.010, gazeFar:200, dwellMs:320 };
 
@@ -104,36 +103,28 @@ function drawInfo(p, e, color) {
 
 /* ============================================================
    XR session manager — explicit immersive-ar / immersive-vr.
-   Follows Meta's documented pattern: requestSession('immersive-ar'),
-   feed the session to A-Frame's renderer, clear alpha 0, hide world.
    ============================================================ */
 AFRAME.registerComponent('xr-launcher', {
   init: function () {
     const self = this;
-    this.scene = this.el;
     this.renderer = null;
     this.bgc = new THREE.Color(CONFIG.bg);
     this.fog = new THREE.FogExp2(this.bgc.getHex(), CONFIG.fogDensity);
-
     this.arBtn = document.getElementById('btn-ar');
     this.vrBtn = document.getElementById('btn-vr');
     this.diag  = document.getElementById('diag');
 
-    this.setWorld(true); // start as dark world on the flat page
+    this.setWorld(true);
 
-    // wait for renderer
-    const ready = () => {
-      self.renderer = self.el.renderer;
-      self.probe();
-    };
+    const ready = () => { self.renderer = self.el.renderer; self.probe(); };
     if (this.el.renderer) ready();
     else this.el.addEventListener('loaded', ready);
 
     this.arBtn.addEventListener('click', () => self.enter('immersive-ar'));
     this.vrBtn.addEventListener('click', () => self.enter('immersive-vr'));
-
     this.el.addEventListener('exit-vr', () => {
       document.body.classList.remove('in-xr');
+      if (window.RFX) window.RFX.isAR = false;
       self.setWorld(true);
     });
   },
@@ -142,17 +133,14 @@ AFRAME.registerComponent('xr-launcher', {
     const self = this;
     if (!navigator.xr) {
       this.diag.innerHTML = 'navigator.xr MISSING — not a WebXR browser / insecure origin';
-      this.diag.className = 'bad';
-      return;
+      this.diag.className = 'bad'; return;
     }
     Promise.all([
       navigator.xr.isSessionSupported('immersive-ar').catch(()=>false),
       navigator.xr.isSessionSupported('immersive-vr').catch(()=>false)
     ]).then(([ar, vr]) => {
-      self.arBtn.disabled = !ar;
-      self.vrBtn.disabled = !vr;
-      self.arBtn.classList.toggle('on', ar);
-      self.vrBtn.classList.toggle('on', vr);
+      self.arBtn.disabled = !ar; self.vrBtn.disabled = !vr;
+      self.arBtn.classList.toggle('on', ar); self.vrBtn.classList.toggle('on', vr);
       self.diag.innerHTML =
         'immersive-ar: <b>' + (ar?'YES':'NO') + '</b> &nbsp; immersive-vr: <b>' + (vr?'YES':'NO') + '</b>' +
         (ar ? '<br>tap ENTER MIXED REALITY for passthrough'
@@ -166,18 +154,19 @@ AFRAME.registerComponent('xr-launcher', {
     if (!navigator.xr || !this.renderer) return;
     const isAR = mode === 'immersive-ar';
     const opts = isAR
-      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','plane-detection'] }
+      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','plane-detection','anchors'] }
       : { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking'] };
 
     navigator.xr.requestSession(mode, opts).then((session) => {
       self.setWorld(!isAR);
-      // hand the session to A-Frame's three.js renderer
+      if (window.RFX) window.RFX.isAR = isAR;
       self.renderer.xr.setReferenceSpaceType('local-floor');
       self.renderer.xr.setSession(session).then(() => {
         document.body.classList.add('in-xr');
       });
       session.addEventListener('end', () => {
         document.body.classList.remove('in-xr');
+        if (window.RFX) window.RFX.isAR = false;
         self.setWorld(true);
       });
     }).catch((err) => {
@@ -186,7 +175,6 @@ AFRAME.registerComponent('xr-launcher', {
     });
   },
 
-  // isDark=true -> VR world; false -> transparent passthrough
   setWorld: function (isDark) {
     const g = this.el.querySelector('#ground'), gr = this.el.querySelector('#grid');
     if (g)  g.setAttribute('visible', isDark);
@@ -199,6 +187,77 @@ AFRAME.registerComponent('xr-launcher', {
       r.setClearAlpha(isDark ? 1 : 0);
     }
     document.body.style.background = isDark ? CONFIG.bg : 'transparent';
+  }
+});
+
+/* ============================================================
+   anchor-lock — welds #world to a real WebXR anchor.
+   The runtime drift-corrects the anchor, so children stay put
+   as the user walks. RECENTER re-drops the anchor under the
+   viewer, aligned to their heading (seed of Phase-B calibration).
+   Fails safe: if anchors are unavailable, #world stays at origin
+   and behaviour matches the un-anchored build.
+   ============================================================ */
+AFRAME.registerComponent('anchor-lock', {
+  init: function () {
+    this.anchor = null;
+    this.pending = false;
+    this.recenterFlag = false;
+    this.world = this.el.object3D;
+    this._q = new THREE.Quaternion();
+  },
+
+  requestRecenter: function () { this.recenterFlag = true; },
+
+  _makeAnchor: function (frame, refSpace, xform) {
+    const self = this, old = this.anchor;
+    this.pending = true;
+    try {
+      frame.createAnchor(xform, refSpace).then(function (a) {
+        if (old && old.delete) { try { old.delete(); } catch (e) {} }
+        self.anchor = a; self.pending = false;
+        if (window.RFX) window.RFX.anchored = true;
+      }).catch(function () { self.pending = false; });
+    } catch (e) { self.pending = false; }
+  },
+
+  tick: function () {
+    const S = window.RFX;
+    if (!S || !S.isAR) return;
+    const scene = this.el.sceneEl;
+    const frame = scene.frame, r = scene.renderer;
+    if (!frame || !r || !r.xr || !frame.createAnchor) return;
+    const refSpace = r.xr.getReferenceSpace();
+    if (!refSpace) return;
+
+    if (this.recenterFlag) {
+      this.recenterFlag = false;
+      const vp = frame.getViewerPose(refSpace);
+      if (vp) {
+        const t = vp.transform;
+        this._q.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+        const e = new THREE.Euler().setFromQuaternion(this._q, 'YXZ');   // yaw-only
+        const yq = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, e.y, 0));
+        const xform = new XRRigidTransform(
+          { x: t.position.x, y: 0, z: t.position.z },
+          { x: yq.x, y: yq.y, z: yq.z, w: yq.w }
+        );
+        this._makeAnchor(frame, refSpace, xform);
+      }
+    }
+
+    if (!this.anchor && !this.pending) {
+      this._makeAnchor(frame, refSpace, new XRRigidTransform());
+    }
+
+    if (this.anchor) {
+      const pose = frame.getPose(this.anchor.anchorSpace, refSpace);
+      if (pose) {
+        const p = pose.transform.position, o = pose.transform.orientation;
+        this.world.position.set(p.x, p.y, p.z);
+        this.world.quaternion.set(o.x, o.y, o.z, o.w);
+      }
+    }
   }
 });
 
@@ -273,7 +332,7 @@ AFRAME.registerComponent('rf-emitter', {
     if (cam) {
       cam.getWorldPosition(this.tmp);
       this.tag.mesh.lookAt(this.tmp);
-      const d = this.tmp.distanceTo(root.position);
+      const d = this.tmp.distanceTo(this.tag.mesh.getWorldPosition(new THREE.Vector3()));
       const k = Math.max(1, d/14);
       this.tag.mesh.scale.setScalar(k);
       this.tag.mesh.position.y = 4.15 + k*0.35;
@@ -338,20 +397,31 @@ AFRAME.registerComponent('control-panel', {
   init: function () {
     const self = this;
     const root = this.el.object3D;
-    this.panel = makeCanvasPanel(0.82, 0.50, 700);
+    this.panel = makeCanvasPanel(0.82, 0.56, 700);
     root.add(this.panel.mesh);
-    const keys = ['playing','speed','beams','reset'];
-    keys.forEach(function (key, i) {
+
+    this.ITEMS = [
+      ['playing','SIMULATION'],
+      ['speed','SPEED'],
+      ['beams','BEAMS'],
+      ['recenter','RECENTER'],
+      ['reset','RESET']
+    ];
+    this.ROWF = [0.30, 0.435, 0.57, 0.705, 0.84];
+
+    const self2 = this;
+    this.ITEMS.forEach(function (it, i) {
+      const yy = 0.28 - self2.ROWF[i]*0.56;
       const hp = new THREE.Mesh(
-        new THREE.PlaneGeometry(0.74, 0.09),
+        new THREE.PlaneGeometry(0.74, 0.066),
         new THREE.MeshBasicMaterial({ visible:false })
       );
-      hp.position.set(0, 0.145 - i*0.098, 0.004);
+      hp.position.set(0, yy, 0.004);
       const holder = document.createElement('a-entity');
       holder.classList.add('ui');
       self.el.appendChild(holder);
       holder.setObject3D('hit', hp);
-      holder.addEventListener('click', function () { self.hit(key); });
+      holder.addEventListener('click', function () { self.hit(it[0]); });
     });
     setTimeout(function(){ self.render(); }, 50);
   },
@@ -360,6 +430,11 @@ AFRAME.registerComponent('control-panel', {
     if (key === 'playing') S.playing = !S.playing;
     else if (key === 'beams') S.beams = !S.beams;
     else if (key === 'speed') S.speed = S.speed >= 4 ? 0.5 : S.speed*2;
+    else if (key === 'recenter') {
+      const w = document.querySelector('#world');
+      const c = w && w.components['anchor-lock'];
+      if (c) c.requestRecenter();
+    }
     else if (key === 'reset') {
       for (let i=0;i<EMITTERS.length;i++){
         EMITTERS[i].pos = S.home[i].pos.slice();
@@ -379,22 +454,26 @@ AFRAME.registerComponent('control-panel', {
     ctx.strokeStyle = '#2dffa0'; ctx.lineWidth = 3; ctx.stroke();
     ctx.textBaseline='middle';
     ctx.fillStyle='#2dffa0'; ctx.textAlign='center';
-    ctx.font = 'bold ' + Math.round(cv.height*0.085) + 'px ui-monospace, monospace';
-    ctx.fillText('CONTROLS', cv.width/2, cv.height*0.10);
-    const rows = [
-      ['SIMULATION', S.playing ? 'RUNNING' : 'PAUSED', S.playing ? '#2dffa0':'#ffb454'],
-      ['SPEED',      S.speed + 'x',                    '#39e0ff'],
-      ['BEAMS',      S.beams ? 'ON' : 'OFF',           S.beams ? '#2dffa0':'#7fae9c'],
-      ['RESET',      'TAP',                            '#ff5252']
-    ];
-    for (let i=0;i<rows.length;i++){
-      const y = cv.height*(0.29 + i*0.196);
-      ctx.font = Math.round(cv.height*0.070) + 'px ui-monospace, monospace';
-      ctx.textAlign='left';  ctx.fillStyle='#7fae9c'; ctx.fillText(rows[i][0], cv.width*0.09, y);
-      ctx.textAlign='right'; ctx.fillStyle=rows[i][2];
-      ctx.font = 'bold ' + Math.round(cv.height*0.075) + 'px ui-monospace, monospace';
-      ctx.fillText(rows[i][1], cv.width*0.91, y);
-    }
+    ctx.font = 'bold ' + Math.round(cv.height*0.078) + 'px ui-monospace, monospace';
+    ctx.fillText('CONTROLS', cv.width/2, cv.height*0.11);
+
+    const vals = {
+      playing:[S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454'],
+      speed:  [S.speed+'x', '#39e0ff'],
+      beams:  [S.beams?'ON':'OFF', S.beams?'#2dffa0':'#7fae9c'],
+      recenter:['TAP', '#39e0ff'],
+      reset:  ['TAP', '#ff5252']
+    };
+    const self = this;
+    this.ITEMS.forEach(function (it, i) {
+      const y = cv.height*self.ROWF[i];
+      const v = vals[it[0]];
+      ctx.font = Math.round(cv.height*0.064) + 'px ui-monospace, monospace';
+      ctx.textAlign='left';  ctx.fillStyle='#7fae9c'; ctx.fillText(it[1], cv.width*0.09, y);
+      ctx.textAlign='right'; ctx.fillStyle=v[1];
+      ctx.font = 'bold ' + Math.round(cv.height*0.068) + 'px ui-monospace, monospace';
+      ctx.fillText(v[0], cv.width*0.91, y);
+    });
     this.panel.tex.needsUpdate = true;
   }
 });
@@ -407,11 +486,12 @@ AFRAME.registerComponent('tactical-grid', {
   }
 });
 
+/* ---------- spawn emitters into #world ---------- */
 AFRAME.registerComponent('emitter-source', {
   init: function () {
     const self = this;
     window.RFX = {
-      playing:true, speed:1, beams:true,
+      playing:true, speed:1, beams:true, isAR:false, anchored:false,
       home: EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
     };
     EMITTERS.forEach(function (e,i) {
@@ -420,7 +500,7 @@ AFRAME.registerComponent('emitter-source', {
       el.setAttribute('rf-emitter', 'idx: ' + i);
       self.el.appendChild(el);
     });
-    setTimeout(function(){ self.el.emit('targets-ready'); }, 400);
+    setTimeout(function(){ self.el.sceneEl.emit('targets-ready'); }, 400);
   }
 });
 </script>
@@ -428,7 +508,7 @@ AFRAME.registerComponent('emitter-source', {
 <style>
   html,body{margin:0;width:100%;height:100%;background:#050807;font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
   #overlay{position:fixed;left:16px;top:16px;z-index:6;color:#2dffa0;background:rgba(4,16,12,.9);
-    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:340px}
+    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:344px}
   #overlay h1{margin:0 0 4px;font-size:14px;letter-spacing:1.5px}
   #overlay p{margin:0 0 12px;font-size:11px;color:#7fae9c;line-height:1.6}
   .btns{display:flex;gap:8px;margin-bottom:10px}
@@ -447,7 +527,7 @@ AFRAME.registerComponent('emitter-source', {
 <body>
 <div id="overlay">
   <h1>RF EMITTER HIGHLIGHTER</h1>
-  <p>Standalone Meta Quest Browser &mdash; not over Link. Gaze an orb to inspect; point &amp; trigger the panel.</p>
+  <p>Standalone Meta Quest Browser &mdash; not over Link. Gaze an orb to inspect; point &amp; trigger the panel. Tap RECENTER to drop the field where you stand.</p>
   <div class="btns">
     <button id="btn-ar" disabled>ENTER MIXED REALITY</button>
     <button id="btn-vr" disabled>ENTER VR</button>
@@ -457,14 +537,17 @@ AFRAME.registerComponent('emitter-source', {
 
 <a-scene
   vr-mode-ui="enabled: false"
-  webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking"
+  webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking, anchors"
   renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
-  xr-launcher gaze-picker emitter-source>
+  xr-launcher gaze-picker>
 
   <a-entity light="type: ambient; color:#668877; intensity:0.9"></a-entity>
 
   <a-plane id="ground" rotation="-90 0 0" width="300" height="300" color="#07110d" material="shader:flat"></a-plane>
   <a-entity id="grid" tactical-grid></a-entity>
+
+  <!-- everything under #world is anchor-locked to the real space -->
+  <a-entity id="world" anchor-lock emitter-source></a-entity>
 
   <a-entity id="rig">
     <a-camera id="head" position="0 1.7 0" look-controls="pointerLockEnabled:false" wasd-controls="enabled:false">
