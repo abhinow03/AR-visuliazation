@@ -1,1 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#050807">
+<title>RF Emitter Highlighter XR</title>
+<script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+<script>
+/* ============================================================
+   RF Emitter Highlighter — passthrough + anchored world.
+   Emitters live under #world, which is locked to a WebXR anchor
+   so they stay welded to real locations as the user walks.
+   ============================================================ */
+const CONFIG = { bg:'#050807', fogDensity:0.010, gazeFar:200, dwellMs:320, debugHUD:true };
 
+const CLASSES = {
+  controller: { name:'DRONE CONTROLLER', color:'#2dffa0' },
+  enemy:      { name:'ENEMY DRONE',      color:'#ff5252' },
+  walkie:     { name:'WALKIE TALKIE',    color:'#5a82ff' }
+};
+
+const EMITTERS = [
+  { id:'EMT-007', cls:'controller', confidence:0.79, pos:[ 14,0,-22], vel:[ 0.35,0,-0.20] },
+  { id:'EMT-013', cls:'enemy',      confidence:0.88, pos:[-30,0,-30], vel:[-1.60,0, 0.90] },
+  { id:'EMT-021', cls:'walkie',     confidence:0.64, pos:[ 40,0, -8], vel:[ 0.10,0, 0.15] },
+  { id:'EMT-031', cls:'enemy',      confidence:0.81, pos:[-10,0, 26], vel:[ 0.60,0, 1.20] }
+];
+
+const COMPASS = ['N','NE','E','SE','S','SW','W','NW'];
+const bearing = (vx,vz) => { let d = Math.atan2(vx,-vz)*180/Math.PI; return d<0 ? d+360 : d; };
+const cardinal = d => COMPASS[Math.round(d/45)%8];
+
+/* ---------- crisp canvas labels ---------- */
+function makeCanvasPanel(w, h, pxPerMeter) {
+  pxPerMeter = pxPerMeter || 220;
+  const cv = document.createElement('canvas');
+  cv.width  = Math.round(w * pxPerMeter);
+  cv.height = Math.round(h * pxPerMeter);
+  const ctx = cv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cv);
+  tex.anisotropy = 16;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = true;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthWrite:false, fog:false, toneMapped:false })
+  );
+  return { cv:cv, ctx:ctx, tex:tex, mesh:mesh, w:w, h:h };
+}
+function roundRect(ctx,x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+function drawTag(p, id, color) {
+  const ctx = p.ctx, cv = p.cv;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.fillStyle = 'rgba(4,16,12,0.86)';
+  roundRect(ctx, 4,4, cv.width-8, cv.height-8, 14); ctx.fill();
+  ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.font = 'bold ' + Math.round(cv.height*0.46) + 'px ui-monospace, Menlo, Consolas, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(id, cv.width/2, cv.height/2);
+  p.tex.needsUpdate = true;
+}
+function drawInfo(p, e, color) {
+  const ctx = p.ctx, cv = p.cv, W = cv.width, H = cv.height;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = 'rgba(4,16,12,0.93)';
+  roundRect(ctx, 5,5, W-10, H-10, 18); ctx.fill();
+  ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.stroke();
+  const pad = W*0.07;
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = color;
+  ctx.font = 'bold ' + Math.round(H*0.11) + 'px ui-monospace, monospace';
+  ctx.textAlign = 'left';  ctx.fillText(e.id, pad, H*0.13);
+  ctx.textAlign = 'right'; ctx.fillText(Math.round(e.confidence*100) + '%', W-pad, H*0.13);
+  ctx.strokeStyle = color; ctx.globalAlpha = 0.45; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(pad,H*0.22); ctx.lineTo(W-pad,H*0.22); ctx.stroke();
+  ctx.globalAlpha = 1;
+  const hd = bearing(e.vel[0], e.vel[2]);
+  const rows = [
+    ['CLASS',     CLASSES[e.cls].name],
+    ['SPEED',     Math.hypot(e.vel[0],e.vel[2]).toFixed(1) + ' m/s'],
+    ['RANGE',     Math.round(Math.hypot(e.pos[0],e.pos[2])) + ' m'],
+    ['DIRECTION', Math.round(hd) + '\u00b0 ' + cardinal(hd)]
+  ];
+  for (let i=0;i<rows.length;i++){
+    const y = H*0.34 + i*H*0.16;
+    ctx.textAlign='left';
+    ctx.fillStyle = '#7fae9c';
+    ctx.font = Math.round(H*0.072) + 'px ui-monospace, monospace';
+    ctx.fillText(rows[i][0], pad, y);
+    ctx.fillStyle = '#eafff6';
+    ctx.font = 'bold ' + Math.round(H*0.085) + 'px ui-monospace, monospace';
+    ctx.textAlign='right'; ctx.fillText(rows[i][1], W-pad, y);
+  }
+  p.tex.needsUpdate = true;
+}
+
+/* ============================================================
+   XR session manager — explicit immersive-ar / immersive-vr.
+   ============================================================ */
+AFRAME.registerComponent('xr-launcher', {
+  init: function () {
+    const self = this;
+    this.renderer = null;
+    this.bgc = new THREE.Color(CONFIG.bg);
+    this.fog = new THREE.FogExp2(this.bgc.getHex(), CONFIG.fogDensity);
+    this.arBtn = document.getElementById('btn-ar');
+    this.vrBtn = document.getElementById('btn-vr');
+    this.diag  = document.getElementById('diag');
+
+    this.setWorld(true);
+
+    const ready = () => { self.renderer = self.el.renderer; self.probe(); };
+    if (this.el.renderer) ready();
+    else this.el.addEventListener('loaded', ready);
+
+    this.arBtn.addEventListener('click', () => self.enter('immersive-ar'));
+    this.vrBtn.addEventListener('click', () => self.enter('immersive-vr'));
+    this.el.addEventListener('exit-vr', () => {
+      document.body.classList.remove('in-xr');
+      if (window.RFX) window.RFX.isAR = false;
+      self.setWorld(true);
+    });
+  },
+
+  probe: function () {
+    const self = this;
+    if (!navigator.xr) {
+      this.diag.innerHTML = 'navigator.xr MISSING — not a WebXR browser / insecure origin';
+      this.diag.className = 'bad'; return;
+    }
+    Promise.all([
+      navigator.xr.isSessionSupported('immersive-ar').catch(()=>false),
+      navigator.xr.isSessionSupported('immersive-vr').catch(()=>false)
+    ]).then(([ar, vr]) => {
+      self.arBtn.disabled = !ar; self.vrBtn.disabled = !vr;
+      self.arBtn.classList.toggle('on', ar); self.vrBtn.classList.toggle('on', vr);
+      self.diag.innerHTML =
+        'immersive-ar: <b>' + (ar?'YES':'NO') + '</b> &nbsp; immersive-vr: <b>' + (vr?'YES':'NO') + '</b>' +
+        (ar ? '<br>tap ENTER MIXED REALITY for passthrough'
+            : '<br>no passthrough here — open in the standalone Meta Quest Browser (not Link)');
+      self.diag.className = ar ? 'ok' : 'warn';
+    });
+  },
+
+  enter: function (mode) {
+    const self = this;
+    if (!navigator.xr || !this.renderer) return;
+    const isAR = mode === 'immersive-ar';
+    const opts = isAR
+      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','plane-detection','anchors'] }
+      : { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking'] };
+
+    navigator.xr.requestSession(mode, opts).then((session) => {
+      self.setWorld(!isAR);
+      if (window.RFX) window.RFX.isAR = isAR;
+      self.renderer.xr.setReferenceSpaceType('local-floor');
+      self.renderer.xr.setSession(session).then(() => {
+        document.body.classList.add('in-xr');
+      });
+      session.addEventListener('end', () => {
+        document.body.classList.remove('in-xr');
+        if (window.RFX) window.RFX.isAR = false;
+        self.setWorld(true);
+      });
+    }).catch((err) => {
+      self.diag.innerHTML = 'session failed: ' + (err && err.message ? err.message : err);
+      self.diag.className = 'bad';
+    });
+  },
+
+  setWorld: function (isDark) {
+    const g = this.el.querySelector('#ground'), gr = this.el.querySelector('#grid');
+    if (g)  g.setAttribute('visible', isDark);
+    if (gr) gr.setAttribute('visible', isDark);
+    this.el.object3D.background = isDark ? this.bgc : null;
+    this.el.object3D.fog        = isDark ? this.fog : null;
+    const r = this.el.renderer;
+    if (r) {
+      r.setClearColor(isDark ? this.bgc.getHex() : 0x000000, isDark ? 1 : 0);
+      r.setClearAlpha(isDark ? 1 : 0);
+    }
+    document.body.style.background = isDark ? CONFIG.bg : 'transparent';
+  }
+});
+
+/* ============================================================
+   anchor-lock — welds #world to a real WebXR anchor.
+   The runtime drift-corrects the anchor, so children stay put
+   as the user walks. RECENTER re-drops the anchor under the
+   viewer, aligned to their heading (seed of Phase-B calibration).
+   Fails safe: if anchors are unavailable, #world stays at origin
+   and behaviour matches the un-anchored build.
+   ============================================================ */
+AFRAME.registerComponent('anchor-lock', {
+  init: function () {
+    this.anchor = null;
+    this.pending = false;
+    this.recenterFlag = false;
+    this.world = this.el.object3D;
+    this._q = new THREE.Quaternion();
+    this.lastPoseOK = false;
+  },
+
+  requestRecenter: function () { this.recenterFlag = true; },
+
+  _makeAnchor: function (frame, refSpace, xform) {
+    const self = this, old = this.anchor;
+    this.pending = true;
+    try {
+      frame.createAnchor(xform, refSpace).then(function (a) {
+        if (old && old.delete) { try { old.delete(); } catch (e) {} }
+        self.anchor = a; self.pending = false;
+        if (window.RFX) window.RFX.anchored = true;
+      }).catch(function () { self.pending = false; });
+    } catch (e) { self.pending = false; }
+  },
+
+  tick: function () {
+    const S = window.RFX;
+    if (!S || !S.isAR) return;
+    const scene = this.el.sceneEl;
+    const frame = scene.frame, r = scene.renderer;
+    if (!frame || !r || !r.xr || !frame.createAnchor) return;
+    const refSpace = r.xr.getReferenceSpace();
+    if (!refSpace) return;
+
+    if (this.recenterFlag) {
+      this.recenterFlag = false;
+      const vp = frame.getViewerPose(refSpace);
+      if (vp) {
+        const t = vp.transform;
+        this._q.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+        const e = new THREE.Euler().setFromQuaternion(this._q, 'YXZ');   // yaw-only
+        const yq = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, e.y, 0));
+        const xform = new XRRigidTransform(
+          { x: t.position.x, y: 0, z: t.position.z },
+          { x: yq.x, y: yq.y, z: yq.z, w: yq.w }
+        );
+        this._makeAnchor(frame, refSpace, xform);
+      }
+    }
+
+    if (!this.anchor && !this.pending) {
+      this._makeAnchor(frame, refSpace, new XRRigidTransform());
+    }
+
+    if (this.anchor) {
+      const pose = frame.getPose(this.anchor.anchorSpace, refSpace);
+      this.lastPoseOK = !!pose;
+      if (pose) {
+        const p = pose.transform.position, o = pose.transform.orientation;
+        this.world.position.set(p.x, p.y, p.z);
+        this.world.quaternion.set(o.x, o.y, o.z, o.w);
+      }
+    } else {
+      this.lastPoseOK = false;
+    }
+  }
+});
+
+/* ---------- head-locked status HUD (verify anchoring) ----------
+   Shows head position in the ANCHORED frame. Walk to a spot, note
+   the numbers, walk away and back: same numbers = beams are fixed.
+   Set CONFIG.debugHUD=false to hide for a clean demo. */
+AFRAME.registerComponent('status-hud', {
+  init: function () {
+    if (!CONFIG.debugHUD) { this.el.object3D.visible = false; return; }
+    this.panel = makeCanvasPanel(0.34, 0.14, 700);
+    this.el.object3D.add(this.panel.mesh);
+    this.v = new THREE.Vector3();
+    this.last = 0;
+  },
+  tick: function (time) {
+    if (!CONFIG.debugHUD) return;
+    if (time - this.last < 150) return;
+    this.last = time;
+    const S = window.RFX, scene = this.el.sceneEl, cam = scene.camera;
+    const worldEl = document.querySelector('#world');
+    const al = worldEl && worldEl.components['anchor-lock'];
+    let hx = '--', hz = '--', anchor = 'OFF', track = '\u2014';
+    if (cam && worldEl) {
+      cam.getWorldPosition(this.v);
+      worldEl.object3D.worldToLocal(this.v);
+      hx = this.v.x.toFixed(1); hz = this.v.z.toFixed(1);
+    }
+    if (al) {
+      anchor = al.anchor ? 'LOCKED' : (S && S.isAR ? 'PENDING' : 'OFF');
+      track  = al.lastPoseOK ? 'OK' : (al.anchor ? 'LOST' : '\u2014');
+    }
+    this.draw(anchor, track, hx, hz);
+  },
+  draw: function (anchor, track, hx, hz) {
+    const ctx = this.panel.ctx, cv = this.panel.cv, W = cv.width, H = cv.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = 'rgba(4,16,12,0.82)';
+    roundRect(ctx,3,3,W-6,H-6,12); ctx.fill();
+    ctx.strokeStyle = anchor === 'LOCKED' ? '#2dffa0' : '#ffb454';
+    ctx.lineWidth = 3; ctx.stroke();
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    ctx.fillStyle = anchor === 'LOCKED' ? '#2dffa0' : '#ffb454';
+    ctx.font = 'bold ' + Math.round(H*0.20) + 'px ui-monospace, monospace';
+    ctx.fillText('ANCHOR ' + anchor, W*0.06, H*0.30);
+    ctx.fillStyle = '#7fae9c';
+    ctx.font = Math.round(H*0.16) + 'px ui-monospace, monospace';
+    ctx.fillText('TRACK ' + track + '   HEAD ' + hx + ' / ' + hz + ' m', W*0.06, H*0.68);
+    this.panel.tex.needsUpdate = true;
+  }
+});
+
+/* ---------- emitter marker ---------- */
+AFRAME.registerComponent('rf-emitter', {
+  schema: { idx:{type:'int', default:0} },
+  init: function () {
+    const e = this.e = EMITTERS[this.data.idx];
+    const color = this.color = CLASSES[e.cls].color;
+    const c3 = new THREE.Color(color);
+    const root = this.el.object3D;
+    const mat = function (o, add) {
+      return new THREE.MeshBasicMaterial({
+        color:c3, transparent:true, opacity:o, fog:false, depthWrite:false, toneMapped:false,
+        blending: add ? THREE.AdditiveBlending : THREE.NormalBlending
+      });
+    };
+    this.beam = new THREE.Mesh(new THREE.CylinderGeometry(0.30,0.30,34,10,1,true), mat(0.15,true));
+    this.beam.position.y = 17; root.add(this.beam);
+    this.core = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,34,6,1,true), mat(0.70,true));
+    this.core.position.y = 17; root.add(this.core);
+    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.25,1.55,48), mat(0.9,false));
+    this.ring.material.side = THREE.DoubleSide;
+    this.ring.rotation.x = -Math.PI/2; this.ring.position.y = 0.03; root.add(this.ring);
+    this.pulse = new THREE.Mesh(new THREE.RingGeometry(0.85,1.05,48), mat(0.7,true));
+    this.pulse.material.side = THREE.DoubleSide;
+    this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
+    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.55,20,16), mat(1.0,false));
+    this.orb.position.y = 2.8; root.add(this.orb);
+    this.halo = new THREE.Mesh(new THREE.SphereGeometry(0.95,16,12), mat(0.18,true));
+    this.halo.position.y = 2.8; root.add(this.halo);
+    this.tag = makeCanvasPanel(2.6, 0.62, 260);
+    drawTag(this.tag, e.id, color);
+    this.tag.mesh.position.set(0, 4.15, 0); root.add(this.tag.mesh);
+    this.info = makeCanvasPanel(3.4, 2.4, 260);
+    drawInfo(this.info, e, color);
+    this.info.mesh.position.set(0, 6.4, 0);
+    this.info.mesh.visible = false; root.add(this.info.mesh);
+    this.phase = Math.random()*1800;
+    this.focused = false;
+    this.tmp = new THREE.Vector3();
+    this.lastDraw = 0;
+  },
+  setFocused: function (f) {
+    if (this.focused === f) return;
+    this.focused = f;
+    this.info.mesh.visible = f;
+    this.beam.material.opacity = f ? 0.34 : 0.15;
+    this.core.material.opacity = f ? 1.0  : 0.70;
+    this.ring.material.opacity = f ? 1.0  : 0.90;
+    this.orb.scale.setScalar(f ? 1.25 : 1.0);
+  },
+  tick: function (time, dt) {
+    const S = window.RFX;
+    if (!S) return;
+    const e = this.e, root = this.el.object3D;
+    const step = Math.min(dt || 16, 50) / 1000;
+    if (S.playing) {
+      e.pos[0] += e.vel[0] * step * S.speed;
+      e.pos[2] += e.vel[2] * step * S.speed;
+      e.vel[0] += Math.sin(time*0.0005 + this.phase)*0.02*step;
+      e.vel[2] += Math.cos(time*0.0004 + this.phase)*0.02*step;
+      if (Math.hypot(e.pos[0], e.pos[2]) > 75) { e.vel[0]*=-1; e.vel[2]*=-1; }
+      root.position.set(e.pos[0], 0, e.pos[2]);
+    }
+    const t = ((time + this.phase) % 1800) / 1800;
+    const s = 1 + t*4.2;
+    this.pulse.scale.set(s,1,s);
+    this.pulse.material.opacity = 0.65 * (1 - t);
+    this.orb.position.y = this.halo.position.y = 2.8 + Math.sin(time*0.0015 + this.phase)*0.12;
+    const cam = this.el.sceneEl.camera;
+    if (cam) {
+      cam.getWorldPosition(this.tmp);
+      this.tag.mesh.lookAt(this.tmp);
+      const d = this.tmp.distanceTo(this.tag.mesh.getWorldPosition(new THREE.Vector3()));
+      const k = Math.max(1, d/14);
+      this.tag.mesh.scale.setScalar(k);
+      this.tag.mesh.position.y = 4.15 + k*0.35;
+      if (this.focused) {
+        this.info.mesh.lookAt(this.tmp);
+        this.info.mesh.scale.setScalar(k);
+        this.info.mesh.position.y = 5.6 + k*1.15;
+        if (S.playing && time - this.lastDraw > 250) {
+          drawInfo(this.info, e, this.color);
+          this.lastDraw = time;
+        }
+      }
+    }
+    this.beam.visible = this.core.visible = S.beams;
+  }
+});
+
+/* ---------- gaze with dwell ---------- */
+AFRAME.registerComponent('gaze-picker', {
+  init: function () {
+    const self = this;
+    this.ray = new THREE.Raycaster();
+    this.ray.far = CONFIG.gazeFar;
+    this.origin = new THREE.Vector3();
+    this.dir = new THREE.Vector3();
+    this.current = null; this.candidate = null; this.since = 0;
+    this.comps = []; this.orbs = [];
+    this.el.addEventListener('targets-ready', function () {
+      self.comps = Array.prototype.map.call(
+        document.querySelectorAll('[rf-emitter]'), function (el) { return el.components['rf-emitter']; });
+      self.orbs = self.comps.map(function (c) { return c.orb; });
+    });
+  },
+  tick: function (time) {
+    const cam = this.el.camera;
+    if (!cam || !this.orbs.length) return;
+    cam.getWorldPosition(this.origin);
+    cam.getWorldDirection(this.dir);
+    this.ray.set(this.origin, this.dir);
+    const hits = this.ray.intersectObjects(this.orbs, false);
+    let comp = null;
+    if (hits.length) {
+      const obj = hits[0].object;
+      for (let i=0;i<this.comps.length;i++) if (this.comps[i].orb === obj) { comp = this.comps[i]; break; }
+    }
+    if (comp !== this.candidate) { this.candidate = comp; this.since = time; }
+    const reticle = document.querySelector('#reticle');
+    if (comp && (time - this.since > CONFIG.dwellMs) && comp !== this.current) {
+      if (this.current) this.current.setFocused(false);
+      comp.setFocused(true); this.current = comp;
+      if (reticle) reticle.setAttribute('material','color: ' + comp.color);
+    }
+    if (!comp && this.current) {
+      this.current.setFocused(false); this.current = null;
+      if (reticle) reticle.setAttribute('material','color: #2dffa0');
+    }
+  }
+});
+
+/* ---------- in-XR control panel ---------- */
+AFRAME.registerComponent('control-panel', {
+  init: function () {
+    const self = this;
+    const root = this.el.object3D;
+    this.panel = makeCanvasPanel(0.82, 0.56, 700);
+    root.add(this.panel.mesh);
+
+    this.ITEMS = [
+      ['playing','SIMULATION'],
+      ['speed','SPEED'],
+      ['beams','BEAMS'],
+      ['recenter','RECENTER'],
+      ['reset','RESET']
+    ];
+    this.ROWF = [0.30, 0.435, 0.57, 0.705, 0.84];
+
+    const self2 = this;
+    this.ITEMS.forEach(function (it, i) {
+      const yy = 0.28 - self2.ROWF[i]*0.56;
+      const hp = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.74, 0.066),
+        new THREE.MeshBasicMaterial({ visible:false })
+      );
+      hp.position.set(0, yy, 0.004);
+      const holder = document.createElement('a-entity');
+      holder.classList.add('ui');
+      self.el.appendChild(holder);
+      holder.setObject3D('hit', hp);
+      holder.addEventListener('click', function () { self.hit(it[0]); });
+    });
+    setTimeout(function(){ self.render(); }, 50);
+  },
+  hit: function (key) {
+    const S = window.RFX;
+    if (key === 'playing') S.playing = !S.playing;
+    else if (key === 'beams') S.beams = !S.beams;
+    else if (key === 'speed') S.speed = S.speed >= 4 ? 0.5 : S.speed*2;
+    else if (key === 'recenter') {
+      const w = document.querySelector('#world');
+      const c = w && w.components['anchor-lock'];
+      if (c) c.requestRecenter();
+    }
+    else if (key === 'reset') {
+      for (let i=0;i<EMITTERS.length;i++){
+        EMITTERS[i].pos = S.home[i].pos.slice();
+        EMITTERS[i].vel = S.home[i].vel.slice();
+      }
+      S.speed = 1; S.playing = true; S.beams = true;
+    }
+    this.render();
+  },
+  render: function () {
+    const S = window.RFX;
+    if (!S) return;
+    const ctx = this.panel.ctx, cv = this.panel.cv;
+    ctx.clearRect(0,0,cv.width,cv.height);
+    ctx.fillStyle = 'rgba(4,16,12,0.94)';
+    roundRect(ctx,4,4,cv.width-8,cv.height-8,16); ctx.fill();
+    ctx.strokeStyle = '#2dffa0'; ctx.lineWidth = 3; ctx.stroke();
+    ctx.textBaseline='middle';
+    ctx.fillStyle='#2dffa0'; ctx.textAlign='center';
+    ctx.font = 'bold ' + Math.round(cv.height*0.078) + 'px ui-monospace, monospace';
+    ctx.fillText('CONTROLS', cv.width/2, cv.height*0.11);
+
+    const vals = {
+      playing:[S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454'],
+      speed:  [S.speed+'x', '#39e0ff'],
+      beams:  [S.beams?'ON':'OFF', S.beams?'#2dffa0':'#7fae9c'],
+      recenter:['TAP', '#39e0ff'],
+      reset:  ['TAP', '#ff5252']
+    };
+    const self = this;
+    this.ITEMS.forEach(function (it, i) {
+      const y = cv.height*self.ROWF[i];
+      const v = vals[it[0]];
+      ctx.font = Math.round(cv.height*0.064) + 'px ui-monospace, monospace';
+      ctx.textAlign='left';  ctx.fillStyle='#7fae9c'; ctx.fillText(it[1], cv.width*0.09, y);
+      ctx.textAlign='right'; ctx.fillStyle=v[1];
+      ctx.font = 'bold ' + Math.round(cv.height*0.068) + 'px ui-monospace, monospace';
+      ctx.fillText(v[0], cv.width*0.91, y);
+    });
+    this.panel.tex.needsUpdate = true;
+  }
+});
+
+AFRAME.registerComponent('tactical-grid', {
+  init: function () {
+    const g = new THREE.GridHelper(300,120, new THREE.Color('#1c6a4f'), new THREE.Color('#0c2f23'));
+    g.material.transparent = true; g.material.opacity = 0.45; g.material.depthWrite = false;
+    this.el.setObject3D('grid', g);
+  }
+});
+
+/* ---------- spawn emitters into #world ---------- */
+AFRAME.registerComponent('emitter-source', {
+  init: function () {
+    const self = this;
+    window.RFX = {
+      playing:true, speed:1, beams:true, isAR:false, anchored:false,
+      home: EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
+    };
+    EMITTERS.forEach(function (e,i) {
+      const el = document.createElement('a-entity');
+      el.setAttribute('position', e.pos[0] + ' 0 ' + e.pos[2]);
+      el.setAttribute('rf-emitter', 'idx: ' + i);
+      self.el.appendChild(el);
+    });
+    setTimeout(function(){ self.el.sceneEl.emit('targets-ready'); }, 400);
+  }
+});
+</script>
+
+<style>
+  html,body{margin:0;width:100%;height:100%;background:#050807;font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
+  #overlay{position:fixed;left:16px;top:16px;z-index:6;color:#2dffa0;background:rgba(4,16,12,.9);
+    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:344px}
+  #overlay h1{margin:0 0 4px;font-size:14px;letter-spacing:1.5px}
+  #overlay p{margin:0 0 12px;font-size:11px;color:#7fae9c;line-height:1.6}
+  .btns{display:flex;gap:8px;margin-bottom:10px}
+  .btns button{flex:1;padding:11px 8px;font-family:inherit;font-size:12px;letter-spacing:.5px;
+    border-radius:7px;border:1px solid #2dffa0;background:rgba(45,255,160,.08);color:#2dffa0;cursor:pointer}
+  .btns button:disabled{opacity:.35;border-color:#3a5b50;color:#5c7d70;cursor:not-allowed}
+  .btns button.on{box-shadow:0 0 14px rgba(45,255,160,.35)}
+  #diag{font-size:11px;line-height:1.6;border-top:1px solid rgba(45,255,160,.25);padding-top:9px}
+  #diag.ok{color:#2dffa0}
+  #diag.warn{color:#ffb454}
+  #diag.bad{color:#ff5252}
+  .in-xr #overlay{display:none}
+</style>
+</head>
+
+<body>
+<div id="overlay">
+  <h1>RF EMITTER HIGHLIGHTER</h1>
+  <p>Standalone Meta Quest Browser &mdash; not over Link. Gaze an orb to inspect; point &amp; trigger the panel. Tap RECENTER to drop the field where you stand.</p>
+  <div class="btns">
+    <button id="btn-ar" disabled>ENTER MIXED REALITY</button>
+    <button id="btn-vr" disabled>ENTER VR</button>
+  </div>
+  <div id="diag">checking XR support&hellip;</div>
+</div>
+
+<a-scene
+  vr-mode-ui="enabled: false"
+  webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking, anchors"
+  renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
+  xr-launcher gaze-picker>
+
+  <a-entity light="type: ambient; color:#668877; intensity:0.9"></a-entity>
+
+  <a-plane id="ground" rotation="-90 0 0" width="300" height="300" color="#07110d" material="shader:flat"></a-plane>
+  <a-entity id="grid" tactical-grid></a-entity>
+
+  <!-- everything under #world is anchor-locked to the real space -->
+  <a-entity id="world" anchor-lock emitter-source></a-entity>
+
+  <a-entity id="rig">
+    <a-camera id="head" position="0 1.7 0" look-controls="pointerLockEnabled:false" wasd-controls="enabled:false">
+      <a-ring id="reticle" position="0 0 -1.2" radius-inner="0.006" radius-outer="0.010"
+        color="#2dffa0" material="shader:flat; fog:false"></a-ring>
+      <a-entity control-panel position="-0.42 -0.28 -0.95" rotation="-18 20 0"></a-entity>
+      <a-entity status-hud position="0 0.22 -0.8"></a-entity>
+    </a-camera>
+    <a-entity laser-controls="hand:left"  raycaster="objects:.ui; far:6"></a-entity>
+    <a-entity laser-controls="hand:right" raycaster="objects:.ui; far:6"></a-entity>
+  </a-entity>
+</a-scene>
+</body>
+</html>
