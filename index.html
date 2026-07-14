@@ -8,10 +8,12 @@
 <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
 <script>
 /* ============================================================
-   CONFIG — 'auto' offers both Enter VR and Enter AR.
-   'vr' = dark world.  'ar' = transparent passthrough.
+   RF Emitter Highlighter — explicit immersive-ar (passthrough).
+   AR passthrough only works in the STANDALONE Meta Quest Browser.
+   Over Quest Link / Air Link the session is opaque VR and
+   immersive-ar reports false (Meta's own docs).
    ============================================================ */
-const CONFIG = { mode:'auto', bg:'#050807', fogDensity:0.010, gazeFar:200, dwellMs:320 };
+const CONFIG = { bg:'#050807', fogDensity:0.010, gazeFar:200, dwellMs:320 };
 
 const CLASSES = {
   controller: { name:'DRONE CONTROLLER', color:'#2dffa0' },
@@ -19,8 +21,6 @@ const CLASSES = {
   walkie:     { name:'WALKIE TALKIE',    color:'#5a82ff' }
 };
 
-/* Emitter feed. Replace with live base-station messages in Phase 2;
-   nothing below this array needs to change. */
 const EMITTERS = [
   { id:'EMT-007', cls:'controller', confidence:0.79, pos:[ 14,0,-22], vel:[ 0.35,0,-0.20] },
   { id:'EMT-013', cls:'enemy',      confidence:0.88, pos:[-30,0,-30], vel:[-1.60,0, 0.90] },
@@ -32,11 +32,7 @@ const COMPASS = ['N','NE','E','SE','S','SW','W','NW'];
 const bearing = (vx,vz) => { let d = Math.atan2(vx,-vz)*180/Math.PI; return d<0 ? d+360 : d; };
 const cardinal = d => COMPASS[Math.round(d/45)%8];
 
-/* ============================================================
-   Crisp text via canvas texture. <a-text> uses a bitmap font
-   atlas that blurs badly at 20m+; a canvas drawn at real pixel
-   density and mipmapped stays legible at any range.
-   ============================================================ */
+/* ---------- crisp canvas labels ---------- */
 function makeCanvasPanel(w, h, pxPerMeter) {
   pxPerMeter = pxPerMeter || 220;
   const cv = document.createElement('canvas');
@@ -54,13 +50,11 @@ function makeCanvasPanel(w, h, pxPerMeter) {
   );
   return { cv:cv, ctx:ctx, tex:tex, mesh:mesh, w:w, h:h };
 }
-
 function roundRect(ctx,x,y,w,h,r){
   ctx.beginPath();
   ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
   ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
 }
-
 function drawTag(p, id, color) {
   const ctx = p.ctx, cv = p.cv;
   ctx.clearRect(0,0,cv.width,cv.height);
@@ -73,25 +67,21 @@ function drawTag(p, id, color) {
   ctx.fillText(id, cv.width/2, cv.height/2);
   p.tex.needsUpdate = true;
 }
-
 function drawInfo(p, e, color) {
   const ctx = p.ctx, cv = p.cv, W = cv.width, H = cv.height;
   ctx.clearRect(0,0,W,H);
   ctx.fillStyle = 'rgba(4,16,12,0.93)';
   roundRect(ctx, 5,5, W-10, H-10, 18); ctx.fill();
   ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.stroke();
-
   const pad = W*0.07;
   ctx.textBaseline = 'middle';
   ctx.fillStyle = color;
   ctx.font = 'bold ' + Math.round(H*0.11) + 'px ui-monospace, monospace';
   ctx.textAlign = 'left';  ctx.fillText(e.id, pad, H*0.13);
   ctx.textAlign = 'right'; ctx.fillText(Math.round(e.confidence*100) + '%', W-pad, H*0.13);
-
   ctx.strokeStyle = color; ctx.globalAlpha = 0.45; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(pad,H*0.22); ctx.lineTo(W-pad,H*0.22); ctx.stroke();
   ctx.globalAlpha = 1;
-
   const hd = bearing(e.vel[0], e.vel[2]);
   const rows = [
     ['CLASS',     CLASSES[e.cls].name],
@@ -113,57 +103,145 @@ function drawInfo(p, e, color) {
 }
 
 /* ============================================================
-   Emitter marker: beam + rings + orb + crisp labels, with motion.
+   XR session manager — explicit immersive-ar / immersive-vr.
+   Follows Meta's documented pattern: requestSession('immersive-ar'),
+   feed the session to A-Frame's renderer, clear alpha 0, hide world.
    ============================================================ */
+AFRAME.registerComponent('xr-launcher', {
+  init: function () {
+    const self = this;
+    this.scene = this.el;
+    this.renderer = null;
+    this.bgc = new THREE.Color(CONFIG.bg);
+    this.fog = new THREE.FogExp2(this.bgc.getHex(), CONFIG.fogDensity);
+
+    this.arBtn = document.getElementById('btn-ar');
+    this.vrBtn = document.getElementById('btn-vr');
+    this.diag  = document.getElementById('diag');
+
+    this.setWorld(true); // start as dark world on the flat page
+
+    // wait for renderer
+    const ready = () => {
+      self.renderer = self.el.renderer;
+      self.probe();
+    };
+    if (this.el.renderer) ready();
+    else this.el.addEventListener('loaded', ready);
+
+    this.arBtn.addEventListener('click', () => self.enter('immersive-ar'));
+    this.vrBtn.addEventListener('click', () => self.enter('immersive-vr'));
+
+    this.el.addEventListener('exit-vr', () => {
+      document.body.classList.remove('in-xr');
+      self.setWorld(true);
+    });
+  },
+
+  probe: function () {
+    const self = this;
+    if (!navigator.xr) {
+      this.diag.innerHTML = 'navigator.xr MISSING — not a WebXR browser / insecure origin';
+      this.diag.className = 'bad';
+      return;
+    }
+    Promise.all([
+      navigator.xr.isSessionSupported('immersive-ar').catch(()=>false),
+      navigator.xr.isSessionSupported('immersive-vr').catch(()=>false)
+    ]).then(([ar, vr]) => {
+      self.arBtn.disabled = !ar;
+      self.vrBtn.disabled = !vr;
+      self.arBtn.classList.toggle('on', ar);
+      self.vrBtn.classList.toggle('on', vr);
+      self.diag.innerHTML =
+        'immersive-ar: <b>' + (ar?'YES':'NO') + '</b> &nbsp; immersive-vr: <b>' + (vr?'YES':'NO') + '</b>' +
+        (ar ? '<br>tap ENTER MIXED REALITY for passthrough'
+            : '<br>no passthrough here — open in the standalone Meta Quest Browser (not Link)');
+      self.diag.className = ar ? 'ok' : 'warn';
+    });
+  },
+
+  enter: function (mode) {
+    const self = this;
+    if (!navigator.xr || !this.renderer) return;
+    const isAR = mode === 'immersive-ar';
+    const opts = isAR
+      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','plane-detection'] }
+      : { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking'] };
+
+    navigator.xr.requestSession(mode, opts).then((session) => {
+      self.setWorld(!isAR);
+      // hand the session to A-Frame's three.js renderer
+      self.renderer.xr.setReferenceSpaceType('local-floor');
+      self.renderer.xr.setSession(session).then(() => {
+        document.body.classList.add('in-xr');
+      });
+      session.addEventListener('end', () => {
+        document.body.classList.remove('in-xr');
+        self.setWorld(true);
+      });
+    }).catch((err) => {
+      self.diag.innerHTML = 'session failed: ' + (err && err.message ? err.message : err);
+      self.diag.className = 'bad';
+    });
+  },
+
+  // isDark=true -> VR world; false -> transparent passthrough
+  setWorld: function (isDark) {
+    const g = this.el.querySelector('#ground'), gr = this.el.querySelector('#grid');
+    if (g)  g.setAttribute('visible', isDark);
+    if (gr) gr.setAttribute('visible', isDark);
+    this.el.object3D.background = isDark ? this.bgc : null;
+    this.el.object3D.fog        = isDark ? this.fog : null;
+    const r = this.el.renderer;
+    if (r) {
+      r.setClearColor(isDark ? this.bgc.getHex() : 0x000000, isDark ? 1 : 0);
+      r.setClearAlpha(isDark ? 1 : 0);
+    }
+    document.body.style.background = isDark ? CONFIG.bg : 'transparent';
+  }
+});
+
+/* ---------- emitter marker ---------- */
 AFRAME.registerComponent('rf-emitter', {
   schema: { idx:{type:'int', default:0} },
-
   init: function () {
     const e = this.e = EMITTERS[this.data.idx];
     const color = this.color = CLASSES[e.cls].color;
     const c3 = new THREE.Color(color);
     const root = this.el.object3D;
-
     const mat = function (o, add) {
       return new THREE.MeshBasicMaterial({
         color:c3, transparent:true, opacity:o, fog:false, depthWrite:false, toneMapped:false,
         blending: add ? THREE.AdditiveBlending : THREE.NormalBlending
       });
     };
-
     this.beam = new THREE.Mesh(new THREE.CylinderGeometry(0.30,0.30,34,10,1,true), mat(0.15,true));
     this.beam.position.y = 17; root.add(this.beam);
     this.core = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,34,6,1,true), mat(0.70,true));
     this.core.position.y = 17; root.add(this.core);
-
     this.ring = new THREE.Mesh(new THREE.RingGeometry(1.25,1.55,48), mat(0.9,false));
     this.ring.material.side = THREE.DoubleSide;
     this.ring.rotation.x = -Math.PI/2; this.ring.position.y = 0.03; root.add(this.ring);
-
     this.pulse = new THREE.Mesh(new THREE.RingGeometry(0.85,1.05,48), mat(0.7,true));
     this.pulse.material.side = THREE.DoubleSide;
     this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
-
     this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.55,20,16), mat(1.0,false));
     this.orb.position.y = 2.8; root.add(this.orb);
     this.halo = new THREE.Mesh(new THREE.SphereGeometry(0.95,16,12), mat(0.18,true));
     this.halo.position.y = 2.8; root.add(this.halo);
-
     this.tag = makeCanvasPanel(2.6, 0.62, 260);
     drawTag(this.tag, e.id, color);
     this.tag.mesh.position.set(0, 4.15, 0); root.add(this.tag.mesh);
-
     this.info = makeCanvasPanel(3.4, 2.4, 260);
     drawInfo(this.info, e, color);
     this.info.mesh.position.set(0, 6.4, 0);
     this.info.mesh.visible = false; root.add(this.info.mesh);
-
     this.phase = Math.random()*1800;
     this.focused = false;
     this.tmp = new THREE.Vector3();
     this.lastDraw = 0;
   },
-
   setFocused: function (f) {
     if (this.focused === f) return;
     this.focused = f;
@@ -173,13 +251,11 @@ AFRAME.registerComponent('rf-emitter', {
     this.ring.material.opacity = f ? 1.0  : 0.90;
     this.orb.scale.setScalar(f ? 1.25 : 1.0);
   },
-
   tick: function (time, dt) {
     const S = window.RFX;
     if (!S) return;
     const e = this.e, root = this.el.object3D;
     const step = Math.min(dt || 16, 50) / 1000;
-
     if (S.playing) {
       e.pos[0] += e.vel[0] * step * S.speed;
       e.pos[2] += e.vel[2] * step * S.speed;
@@ -188,13 +264,11 @@ AFRAME.registerComponent('rf-emitter', {
       if (Math.hypot(e.pos[0], e.pos[2]) > 75) { e.vel[0]*=-1; e.vel[2]*=-1; }
       root.position.set(e.pos[0], 0, e.pos[2]);
     }
-
     const t = ((time + this.phase) % 1800) / 1800;
     const s = 1 + t*4.2;
     this.pulse.scale.set(s,1,s);
     this.pulse.material.opacity = 0.65 * (1 - t);
     this.orb.position.y = this.halo.position.y = 2.8 + Math.sin(time*0.0015 + this.phase)*0.12;
-
     const cam = this.el.sceneEl.camera;
     if (cam) {
       cam.getWorldPosition(this.tmp);
@@ -207,21 +281,17 @@ AFRAME.registerComponent('rf-emitter', {
         this.info.mesh.lookAt(this.tmp);
         this.info.mesh.scale.setScalar(k);
         this.info.mesh.position.y = 5.6 + k*1.15;
-        // throttle the redraw: canvas uploads are the expensive part
         if (S.playing && time - this.lastDraw > 250) {
           drawInfo(this.info, e, this.color);
           this.lastDraw = time;
         }
       }
     }
-
     this.beam.visible = this.core.visible = S.beams;
   }
 });
 
-/* ============================================================
-   Gaze with dwell. Instant selection flickers as the head drifts.
-   ============================================================ */
+/* ---------- gaze with dwell ---------- */
 AFRAME.registerComponent('gaze-picker', {
   init: function () {
     const self = this;
@@ -243,16 +313,13 @@ AFRAME.registerComponent('gaze-picker', {
     cam.getWorldPosition(this.origin);
     cam.getWorldDirection(this.dir);
     this.ray.set(this.origin, this.dir);
-
     const hits = this.ray.intersectObjects(this.orbs, false);
     let comp = null;
     if (hits.length) {
       const obj = hits[0].object;
       for (let i=0;i<this.comps.length;i++) if (this.comps[i].orb === obj) { comp = this.comps[i]; break; }
     }
-
     if (comp !== this.candidate) { this.candidate = comp; this.since = time; }
-
     const reticle = document.querySelector('#reticle');
     if (comp && (time - this.since > CONFIG.dwellMs) && comp !== this.current) {
       if (this.current) this.current.setFocused(false);
@@ -266,17 +333,13 @@ AFRAME.registerComponent('gaze-picker', {
   }
 });
 
-/* ============================================================
-   In-XR control panel — reachable, clickable with the laser.
-   ============================================================ */
+/* ---------- in-XR control panel ---------- */
 AFRAME.registerComponent('control-panel', {
   init: function () {
     const self = this;
     const root = this.el.object3D;
-
     this.panel = makeCanvasPanel(0.82, 0.50, 700);
     root.add(this.panel.mesh);
-
     const keys = ['playing','speed','beams','reset'];
     keys.forEach(function (key, i) {
       const hp = new THREE.Mesh(
@@ -290,10 +353,8 @@ AFRAME.registerComponent('control-panel', {
       holder.setObject3D('hit', hp);
       holder.addEventListener('click', function () { self.hit(key); });
     });
-
     setTimeout(function(){ self.render(); }, 50);
   },
-
   hit: function (key) {
     const S = window.RFX;
     if (key === 'playing') S.playing = !S.playing;
@@ -308,7 +369,6 @@ AFRAME.registerComponent('control-panel', {
     }
     this.render();
   },
-
   render: function () {
     const S = window.RFX;
     if (!S) return;
@@ -317,12 +377,10 @@ AFRAME.registerComponent('control-panel', {
     ctx.fillStyle = 'rgba(4,16,12,0.94)';
     roundRect(ctx,4,4,cv.width-8,cv.height-8,16); ctx.fill();
     ctx.strokeStyle = '#2dffa0'; ctx.lineWidth = 3; ctx.stroke();
-
     ctx.textBaseline='middle';
     ctx.fillStyle='#2dffa0'; ctx.textAlign='center';
     ctx.font = 'bold ' + Math.round(cv.height*0.085) + 'px ui-monospace, monospace';
     ctx.fillText('CONTROLS', cv.width/2, cv.height*0.10);
-
     const rows = [
       ['SIMULATION', S.playing ? 'RUNNING' : 'PAUSED', S.playing ? '#2dffa0':'#ffb454'],
       ['SPEED',      S.speed + 'x',                    '#39e0ff'],
@@ -338,57 +396,6 @@ AFRAME.registerComponent('control-panel', {
       ctx.fillText(rows[i][1], cv.width*0.91, y);
     }
     this.panel.tex.needsUpdate = true;
-  }
-});
-
-/* ---------- environment: VR world vs AR passthrough ----------
-   Detects AR from the live XR session's environmentBlendMode, which is
-   authoritative. A-Frame's 'ar-mode' state can lag the enter-vr event. */
-AFRAME.registerComponent('environment-mode', {
-  init: function () {
-    const self = this;
-    this.bgc = new THREE.Color(CONFIG.bg);
-    this.fog = new THREE.FogExp2(this.bgc.getHex(), CONFIG.fogDensity);
-    this.apply(CONFIG.mode === 'ar');
-
-    this.el.addEventListener('enter-vr', function () {
-      document.body.classList.add('in-xr');
-      self.apply(self.detectAR());
-      // some runtimes populate the session a tick late
-      setTimeout(function () { self.apply(self.detectAR()); }, 100);
-    });
-    this.el.addEventListener('exit-vr', function () {
-      document.body.classList.remove('in-xr');
-      self.apply(CONFIG.mode === 'ar');
-    });
-  },
-
-  detectAR: function () {
-    if (CONFIG.mode === 'ar') return true;
-    if (CONFIG.mode === 'vr') return false;
-    const sess = this.el.renderer && this.el.renderer.xr && this.el.renderer.xr.getSession
-      ? this.el.renderer.xr.getSession() : null;
-    if (sess) {
-      // 'additive' or 'alpha-blend' => the real world is showing through
-      const m = sess.environmentBlendMode;
-      if (m === 'additive' || m === 'alpha-blend') return true;
-      if (m === 'opaque') return false;
-    }
-    return !!this.el.is('ar-mode');
-  },
-
-  apply: function (isAR) {
-    const g = this.el.querySelector('#ground'), gr = this.el.querySelector('#grid');
-    if (g)  g.setAttribute('visible', !isAR);
-    if (gr) gr.setAttribute('visible', !isAR);
-    this.el.object3D.background = isAR ? null : this.bgc;
-    this.el.object3D.fog        = isAR ? null : this.fog;
-    const r = this.el.renderer;
-    if (r) {
-      r.setClearColor(isAR ? 0x000000 : this.bgc.getHex(), isAR ? 0 : 1);
-      r.setClearAlpha(isAR ? 0 : 1);
-    }
-    document.body.style.background = isAR ? 'transparent' : CONFIG.bg;
   }
 });
 
@@ -419,55 +426,40 @@ AFRAME.registerComponent('emitter-source', {
 </script>
 
 <style>
-  html,body{margin:0;width:100%;height:100%;background:#050807;font-family:monospace;overflow:hidden}
-  .note{position:fixed;left:16px;top:16px;z-index:5;color:#2dffa0;background:rgba(4,16,12,.86);
-    border:1px solid rgba(45,255,160,.35);padding:10px 12px;border-radius:7px;pointer-events:none;font-size:12px}
-  .note small{display:block;color:#7fae9c;margin-top:4px;line-height:1.6}
-  .in-xr .note{display:none}
+  html,body{margin:0;width:100%;height:100%;background:#050807;font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
+  #overlay{position:fixed;left:16px;top:16px;z-index:6;color:#2dffa0;background:rgba(4,16,12,.9);
+    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:340px}
+  #overlay h1{margin:0 0 4px;font-size:14px;letter-spacing:1.5px}
+  #overlay p{margin:0 0 12px;font-size:11px;color:#7fae9c;line-height:1.6}
+  .btns{display:flex;gap:8px;margin-bottom:10px}
+  .btns button{flex:1;padding:11px 8px;font-family:inherit;font-size:12px;letter-spacing:.5px;
+    border-radius:7px;border:1px solid #2dffa0;background:rgba(45,255,160,.08);color:#2dffa0;cursor:pointer}
+  .btns button:disabled{opacity:.35;border-color:#3a5b50;color:#5c7d70;cursor:not-allowed}
+  .btns button.on{box-shadow:0 0 14px rgba(45,255,160,.35)}
+  #diag{font-size:11px;line-height:1.6;border-top:1px solid rgba(45,255,160,.25);padding-top:9px}
+  #diag.ok{color:#2dffa0}
+  #diag.warn{color:#ffb454}
+  #diag.bad{color:#ff5252}
+  .in-xr #overlay{display:none}
 </style>
 </head>
 
 <body>
-<div class="note">
-  RF EMITTER HIGHLIGHTER XR
-  <small>Desktop: drag to look &middot; Headset: Enter AR / Enter VR<br>Gaze an orb to inspect &middot; Point &amp; trigger the panel</small>
-  <small id="xrdiag" style="margin-top:8px;border-top:1px solid rgba(45,255,160,.25);padding-top:6px">
-    checking XR support&hellip;</small>
+<div id="overlay">
+  <h1>RF EMITTER HIGHLIGHTER</h1>
+  <p>Standalone Meta Quest Browser &mdash; not over Link. Gaze an orb to inspect; point &amp; trigger the panel.</p>
+  <div class="btns">
+    <button id="btn-ar" disabled>ENTER MIXED REALITY</button>
+    <button id="btn-vr" disabled>ENTER VR</button>
+  </div>
+  <div id="diag">checking XR support&hellip;</div>
 </div>
 
-<script>
-/* Capability probe: tells you BEFORE you put the headset on whether this
-   browser/session can do passthrough AR at all. */
-(function () {
-  const out = document.getElementById('xrdiag');
-  const say = (msg, ok) => {
-    out.innerHTML = msg;
-    out.style.color = ok ? '#2dffa0' : '#ffb454';
-  };
-  if (!navigator.xr) {
-    say('navigator.xr MISSING<br>not a WebXR browser (or insecure origin)', false);
-    return;
-  }
-  Promise.all([
-    navigator.xr.isSessionSupported('immersive-ar').catch(() => false),
-    navigator.xr.isSessionSupported('immersive-vr').catch(() => false)
-  ]).then(([ar, vr]) => {
-    say(
-      'immersive-ar: <b>' + (ar ? 'YES' : 'NO') + '</b><br>' +
-      'immersive-vr: <b>' + (vr ? 'YES' : 'NO') + '</b><br>' +
-      (ar ? 'press ENTER AR for passthrough'
-          : 'no passthrough &mdash; not Quest Browser, or running over Link'),
-      ar
-    );
-  });
-})();
-</script>
-
 <a-scene
-  vr-mode-ui="enabled: true"
+  vr-mode-ui="enabled: false"
   webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking"
   renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
-  environment-mode gaze-picker emitter-source>
+  xr-launcher gaze-picker emitter-source>
 
   <a-entity light="type: ambient; color:#668877; intensity:0.9"></a-entity>
 
@@ -480,7 +472,6 @@ AFRAME.registerComponent('emitter-source', {
         color="#2dffa0" material="shader:flat; fog:false"></a-ring>
       <a-entity control-panel position="-0.42 -0.28 -0.95" rotation="-18 20 0"></a-entity>
     </a-camera>
-
     <a-entity laser-controls="hand:left"  raycaster="objects:.ui; far:6"></a-entity>
     <a-entity laser-controls="hand:right" raycaster="objects:.ui; far:6"></a-entity>
   </a-entity>
