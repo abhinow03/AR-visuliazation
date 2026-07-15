@@ -8,14 +8,18 @@
 <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
 <script>
 /* ============================================================
-   RF Emitter Highlighter — tactical build.
-   Passthrough MR, anchor-locked emitters, HUD-style contextual
-   readout, animated energy beams, claim/handled marking.
+   RF Emitter Highlighter — tactical build v8
+   - live DEMO SCALE (thumbstick): shrinks the WORLD, ranges stay true
+   - fresnel rim glow (fake bloom, no postprocessing)
+   - ground scan field
+   - readable status strip (toggle with A/X)
    ============================================================ */
 const CONFIG = {
   bg:'#050807', fogDensity:0.010,
   gazeFar:250, dwellMs:280, claimDwellMs:1400,
-  debugHUD:true
+  scale: 0.18,          // starting world scale (1.0 = true metres)
+  scaleMin: 0.04, scaleMax: 1.0,
+  showStatus: true      // A/X toggles in-headset
 };
 
 const CLASSES = {
@@ -25,6 +29,7 @@ const CLASSES = {
 };
 const CLAIM_COLOR = '#ffb454';
 
+/* True field coordinates in metres. Never mutated by scale. */
 const EMITTERS = [
   { id:'EMT-007', cls:'controller', confidence:0.79, pos:[ 14,0,-22], vel:[ 0.35,0,-0.20] },
   { id:'EMT-013', cls:'enemy',      confidence:0.88, pos:[-30,0,-30], vel:[-1.60,0, 0.90] },
@@ -38,7 +43,7 @@ const cardinal = d => COMPASS[Math.round(d/45)%8];
 
 /* ---------- canvas panels ---------- */
 function makeCanvasPanel(w, h, pxPerMeter) {
-  pxPerMeter = pxPerMeter || 220;
+  pxPerMeter = pxPerMeter || 2200;
   const cv = document.createElement('canvas');
   cv.width  = Math.round(w * pxPerMeter);
   cv.height = Math.round(h * pxPerMeter);
@@ -61,50 +66,96 @@ function roundRect(ctx,x,y,w,h,r){
   ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
 }
 
-/* ============================================================
-   Animated energy-band beam shader.
-   Additive, scrolling bands + soft vertical falloff. No
-   postprocessing: reads as emitted light through passthrough
-   and costs one cheap fragment shader per beam.
-   ============================================================ */
+/* ---------- animated energy beam ---------- */
 function makeBeamMaterial(colorHex) {
   return new THREE.ShaderMaterial({
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    side: THREE.DoubleSide,
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, side:THREE.DoubleSide,
     uniforms: {
-      uColor:   { value: new THREE.Color(colorHex) },
-      uTime:    { value: 0 },
-      uActive:  { value: 0.0 },
-      uOpacity: { value: 0.85 }
+      uColor:{ value:new THREE.Color(colorHex) }, uTime:{ value:0 },
+      uActive:{ value:0.0 }, uOpacity:{ value:0.9 }
     },
     vertexShader: [
       'varying vec2 vUv;',
-      'void main() {',
-      '  vUv = uv;',
-      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+      'void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 uColor; uniform float uTime; uniform float uActive; uniform float uOpacity;',
+      'varying vec2 vUv;',
+      'void main(){',
+      '  float fade = pow(1.0 - vUv.y, 1.5);',
+      '  float bands = sin((vUv.y * 20.0) - uTime * 2.4);',
+      '  bands = smoothstep(0.5, 1.0, bands) * 0.6;',
+      '  float sweep = smoothstep(0.88, 1.0, sin((vUv.y * 3.0) - uTime * (2.0 + uActive * 5.0)));',
+      '  float edge = sin(vUv.x * 3.14159);',
+      '  float a = (fade * (0.32 + bands + sweep * 0.8)) * edge;',
+      '  a *= uOpacity * (0.55 + uActive * 0.8);',
+      '  gl_FragColor = vec4(uColor * (1.0 + uActive * 0.7), a);',
+      '}'
+    ].join('\n')
+  });
+}
+
+/* ---------- fresnel rim glow (fake bloom, one cheap shader) ---------- */
+function makeFresnelMaterial(colorHex) {
+  return new THREE.ShaderMaterial({
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, side:THREE.FrontSide,
+    uniforms: {
+      uColor:{ value:new THREE.Color(colorHex) }, uTime:{ value:0 },
+      uActive:{ value:0.0 }, uPower:{ value:2.6 }
+    },
+    vertexShader: [
+      'varying vec3 vN; varying vec3 vV;',
+      'void main(){',
+      '  vec4 mv = modelViewMatrix * vec4(position,1.0);',
+      '  vN = normalize(normalMatrix * normal);',
+      '  vV = normalize(-mv.xyz);',
+      '  gl_Position = projectionMatrix * mv;',
       '}'
     ].join('\n'),
     fragmentShader: [
-      'uniform vec3 uColor;',
-      'uniform float uTime;',
-      'uniform float uActive;',
-      'uniform float uOpacity;',
+      'uniform vec3 uColor; uniform float uTime; uniform float uActive; uniform float uPower;',
+      'varying vec3 vN; varying vec3 vV;',
+      'void main(){',
+      // rim = bright where surface faces away from viewer
+      '  float rim = 1.0 - max(dot(normalize(vN), normalize(vV)), 0.0);',
+      '  rim = pow(rim, uPower);',
+      '  float pulse = 0.85 + 0.15 * sin(uTime * 2.0);',
+      '  float a = rim * pulse * (0.75 + uActive * 0.8);',
+      '  gl_FragColor = vec4(uColor * (1.3 + uActive * 0.8), a);',
+      '}'
+    ].join('\n')
+  });
+}
+
+/* ---------- ground scan field: expanding rings + grid pulse ---------- */
+function makeScanMaterial() {
+  return new THREE.ShaderMaterial({
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, side:THREE.DoubleSide,
+    uniforms: { uColor:{ value:new THREE.Color('#2dffa0') }, uTime:{ value:0 } },
+    vertexShader: [
       'varying vec2 vUv;',
-      'void main() {',
-      // vertical falloff: bright at base, fading upward
-      '  float fade = pow(1.0 - vUv.y, 1.6);',
-      // scrolling energy bands
-      '  float bands = sin((vUv.y * 18.0) - uTime * 2.2);',
-      '  bands = smoothstep(0.55, 1.0, bands) * 0.55;',
-      // faster sweep pulse when focused
-      '  float sweep = smoothstep(0.90, 1.0, sin((vUv.y * 3.0) - uTime * (2.0 + uActive * 5.0)));',
-      // soft edges across the cylinder
-      '  float edge = sin(vUv.x * 3.14159);',
-      '  float a = (fade * (0.30 + bands + sweep * 0.7)) * edge;',
-      '  a *= uOpacity * (0.55 + uActive * 0.75);',
-      '  gl_FragColor = vec4(uColor * (1.0 + uActive * 0.6), a);',
+      'void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 uColor; uniform float uTime;',
+      'varying vec2 vUv;',
+      'void main(){',
+      '  vec2 p = vUv - 0.5;',
+      '  float r = length(p) * 2.0;',
+      '  if (r > 1.0) discard;',
+      // expanding scan rings
+      '  float ring = sin(r * 26.0 - uTime * 1.6);',
+      '  ring = smoothstep(0.86, 1.0, ring) * 0.5;',
+      // faint tactical grid
+      '  vec2 g = abs(fract(vUv * 26.0) - 0.5);',
+      '  float grid = smoothstep(0.46, 0.5, max(g.x, g.y)) * 0.10;',
+      // radar sweep arm
+      '  float ang = atan(p.y, p.x);',
+      '  float sweep = smoothstep(0.90, 1.0, cos(ang - uTime * 0.7));',
+      '  sweep *= (1.0 - r) * 0.35;',
+      '  float falloff = pow(1.0 - r, 1.4);',
+      '  float a = (ring + grid + sweep) * falloff * 0.55;',
+      '  gl_FragColor = vec4(uColor, a);',
       '}'
     ].join('\n')
   });
@@ -148,7 +199,7 @@ AFRAME.registerComponent('xr-launcher', {
       self.diag.innerHTML =
         'immersive-ar: <b>' + (ar?'YES':'NO') + '</b> &nbsp; immersive-vr: <b>' + (vr?'YES':'NO') + '</b>' +
         (ar ? '<br>tap ENTER MIXED REALITY for passthrough'
-            : '<br>no passthrough here — open in the standalone Meta Quest Browser (not Link)');
+            : '<br>no passthrough — use the standalone Meta Quest Browser (not Link)');
       self.diag.className = ar ? 'ok' : 'warn';
     });
   },
@@ -187,16 +238,17 @@ AFRAME.registerComponent('xr-launcher', {
 });
 
 /* ============================================================
-   anchor-lock — welds #world to a WebXR anchor.
-   NOTE: this is LOCAL drift-corrected anchoring, the ceiling on
-   this hardware. Quest has no GPS/compass, so true global
-   "absolute" coordinates are not obtainable here.
+   anchor-lock. Anchor creation is already single-shot: it only
+   runs when recenter is requested, or when no anchor exists yet.
+   Reading the pose every frame is the anchor WORKING (the runtime
+   drift-corrects it) — not an overwrite.
    ============================================================ */
 AFRAME.registerComponent('anchor-lock', {
   init: function () {
     this.anchor = null; this.pending = false; this.recenterFlag = false;
     this.world = this.el.object3D; this._q = new THREE.Quaternion();
-    this.lastPoseOK = false;
+    this.lastPoseOK = false; this.anchorCount = 0;
+    this.anchorPos = new THREE.Vector3();
   },
   requestRecenter: function () { this.recenterFlag = true; },
   _makeAnchor: function (frame, refSpace, xform) {
@@ -205,7 +257,7 @@ AFRAME.registerComponent('anchor-lock', {
     try {
       frame.createAnchor(xform, refSpace).then(function (a) {
         if (old && old.delete) { try { old.delete(); } catch (e) {} }
-        self.anchor = a; self.pending = false;
+        self.anchor = a; self.pending = false; self.anchorCount++;
         if (window.RFX) window.RFX.anchored = true;
       }).catch(function () { self.pending = false; });
     } catch (e) { self.pending = false; }
@@ -226,8 +278,8 @@ AFRAME.registerComponent('anchor-lock', {
         const e = new THREE.Euler().setFromQuaternion(this._q, 'YXZ');
         const yq = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, e.y, 0));
         this._makeAnchor(frame, refSpace, new XRRigidTransform(
-          { x: t.position.x, y: 0, z: t.position.z },
-          { x: yq.x, y: yq.y, z: yq.z, w: yq.w }));
+          { x:t.position.x, y:0, z:t.position.z },
+          { x:yq.x, y:yq.y, z:yq.z, w:yq.w }));
       }
     }
     if (!this.anchor && !this.pending) this._makeAnchor(frame, refSpace, new XRRigidTransform());
@@ -238,13 +290,29 @@ AFRAME.registerComponent('anchor-lock', {
         const p = pose.transform.position, o = pose.transform.orientation;
         this.world.position.set(p.x, p.y, p.z);
         this.world.quaternion.set(o.x, o.y, o.z, o.w);
+        this.anchorPos.set(p.x, p.y, p.z);
       }
-    } else this.lastPoseOK = false;
+    } else {
+      this.lastPoseOK = false;
+    }
+  }
+});
+
+/* ---------- world scale: independent of anchoring, always applied ----------
+   Scales the WORLD only. Emitter coordinates stay true metres, so the HUD
+   keeps reporting real ranges — the layout shrinks, the data doesn't lie. */
+AFRAME.registerComponent('world-scale', {
+  tick: function () {
+    const S = window.RFX;
+    if (!S) return;
+    const s = S.scale;
+    const o = this.el.object3D;
+    if (o.scale.x !== s) o.scale.set(s, s, s);
   }
 });
 
 /* ============================================================
-   Emitter marker — energy beam, lock-on shell, claim state.
+   Emitter marker
    ============================================================ */
 AFRAME.registerComponent('rf-emitter', {
   schema: { idx:{type:'int', default:0} },
@@ -255,7 +323,6 @@ AFRAME.registerComponent('rf-emitter', {
     const root = this.el.object3D;
     const c3 = new THREE.Color(this.baseColor);
 
-    // animated energy beam
     this.beamMat = makeBeamMaterial(this.baseColor);
     this.beam = new THREE.Mesh(new THREE.CylinderGeometry(0.34,0.34,30,12,1,true), this.beamMat);
     this.beam.position.y = 15; root.add(this.beam);
@@ -264,7 +331,6 @@ AFRAME.registerComponent('rf-emitter', {
       color:c3, transparent:true, opacity:o, fog:false, depthWrite:false,
       toneMapped:false, blending:THREE.AdditiveBlending });
 
-    // ground rings
     this.ring = new THREE.Mesh(new THREE.RingGeometry(1.15,1.45,44), add(0.85));
     this.ring.material.side = THREE.DoubleSide;
     this.ring.rotation.x = -Math.PI/2; this.ring.position.y = 0.03; root.add(this.ring);
@@ -272,21 +338,22 @@ AFRAME.registerComponent('rf-emitter', {
     this.pulse.material.side = THREE.DoubleSide;
     this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
 
-    // core orb (raycast target) + fake-bloom halo sprite
-    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.5,20,16),
+    // solid core (raycast target)
+    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.62,22,18),
       new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false }));
     this.orb.position.y = 2.6; root.add(this.orb);
-    this.halo = new THREE.Mesh(new THREE.SphereGeometry(0.85,16,12), add(0.22));
-    this.halo.position.y = 2.6; root.add(this.halo);
 
-    // rotating lock-on shell
-    this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.05, 1),
+    // fresnel rim shell — fake bloom, makes it emit light into the room
+    this.rimMat = makeFresnelMaterial(this.baseColor);
+    this.rim = new THREE.Mesh(new THREE.SphereGeometry(0.95,24,18), this.rimMat);
+    this.rim.position.y = 2.6; root.add(this.rim);
+
+    this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.25, 1),
       new THREE.MeshBasicMaterial({ color:c3, wireframe:true, transparent:true,
         opacity:0.30, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
     this.shell.position.y = 2.6; root.add(this.shell);
 
-    // claim marker (hidden until claimed)
-    this.claimRing = new THREE.Mesh(new THREE.TorusGeometry(1.35, 0.06, 8, 40),
+    this.claimRing = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.07, 8, 40),
       new THREE.MeshBasicMaterial({ color:new THREE.Color(CLAIM_COLOR), transparent:true,
         opacity:0.9, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
     this.claimRing.rotation.x = -Math.PI/2; this.claimRing.position.y = 0.12;
@@ -294,38 +361,33 @@ AFRAME.registerComponent('rf-emitter', {
 
     this.phase = Math.random()*1800;
     this.focused = false;
-    this.tmp = new THREE.Vector3();
   },
-
   setFocused: function (f) {
     if (this.focused === f) return;
     this.focused = f;
     this.beamMat.uniforms.uActive.value = f ? 1.0 : 0.0;
-    this.orb.scale.setScalar(f ? 1.3 : 1.0);
+    this.rimMat.uniforms.uActive.value = f ? 1.0 : 0.0;
+    this.orb.scale.setScalar(f ? 1.25 : 1.0);
     this.shell.material.opacity = f ? 0.7 : 0.30;
   },
-
   toggleClaim: function () {
     this.claimed = !this.claimed;
     this.claimRing.visible = this.claimed;
     const c = new THREE.Color(this.claimed ? CLAIM_COLOR : this.baseColor);
     this.beamMat.uniforms.uColor.value.copy(c);
+    this.rimMat.uniforms.uColor.value.copy(c);
     this.orb.material.color.copy(c);
-    this.halo.material.color.copy(c);
     this.shell.material.color.copy(c);
     this.ring.material.color.copy(c);
     this.pulse.material.color.copy(c);
     return this.claimed;
   },
-
   currentColor: function () { return this.claimed ? CLAIM_COLOR : this.baseColor; },
-
   tick: function (time, dt) {
     const S = window.RFX;
     if (!S) return;
     const e = this.e, root = this.el.object3D;
     const step = Math.min(dt || 16, 50) / 1000;
-
     if (S.playing) {
       e.pos[0] += e.vel[0] * step * S.speed;
       e.pos[2] += e.vel[2] * step * S.speed;
@@ -334,16 +396,16 @@ AFRAME.registerComponent('rf-emitter', {
       if (Math.hypot(e.pos[0], e.pos[2]) > 75) { e.vel[0]*=-1; e.vel[2]*=-1; }
       root.position.set(e.pos[0], 0, e.pos[2]);
     }
-
-    this.beamMat.uniforms.uTime.value = time * 0.001;
+    const ts = time * 0.001;
+    this.beamMat.uniforms.uTime.value = ts;
+    this.rimMat.uniforms.uTime.value = ts;
     this.beam.visible = S.beams;
-
     const t = ((time + this.phase) % 1800) / 1800;
     const s = 1 + t*4.0;
     this.pulse.scale.set(s,1,s);
     this.pulse.material.opacity = 0.6 * (1 - t);
     const bob = 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
-    this.orb.position.y = this.halo.position.y = this.shell.position.y = bob;
+    this.orb.position.y = this.rim.position.y = this.shell.position.y = bob;
     this.shell.rotation.y += step * (this.focused ? 1.1 : 0.35);
     this.shell.rotation.x += step * 0.15;
     if (this.claimed) {
@@ -353,8 +415,19 @@ AFRAME.registerComponent('rf-emitter', {
   }
 });
 
+/* ---------- ground scan field ---------- */
+AFRAME.registerComponent('scan-field', {
+  init: function () {
+    this.mat = makeScanMaterial();
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(160,160), this.mat);
+    m.rotation.x = -Math.PI/2; m.position.y = 0.01;
+    this.el.setObject3D('scan', m);
+  },
+  tick: function (time) { this.mat.uniforms.uTime.value = time * 0.001; }
+});
+
 /* ============================================================
-   Gaze + claim. Dwell to focus; longer dwell OR trigger to claim.
+   Gaze + claim
    ============================================================ */
 AFRAME.registerComponent('gaze-picker', {
   init: function () {
@@ -368,8 +441,7 @@ AFRAME.registerComponent('gaze-picker', {
         function (el) { return el.components['rf-emitter']; });
       self.orbs = self.comps.map(function (c) { return c.orb; });
     });
-    // controller trigger claims whatever is gazed
-    ['triggerdown','abuttondown','xbuttondown'].forEach(function (evt) {
+    ['triggerdown'].forEach(function (evt) {
       self.el.addEventListener(evt, function () { self.claim(); });
     });
   },
@@ -398,8 +470,6 @@ AFRAME.registerComponent('gaze-picker', {
       comp.setFocused(true); this.current = comp; this.claimArmed = 0;
     }
     if (!comp && this.current) { this.current.setFocused(false); this.current = null; this.claimArmed = 0; }
-
-    // gaze-dwell claim
     if (this.current && comp === this.current) {
       this.claimArmed += (dt || 16);
       if (this.claimArmed > CONFIG.claimDwellMs + CONFIG.dwellMs) this.claim();
@@ -411,8 +481,7 @@ AFRAME.registerComponent('gaze-picker', {
 });
 
 /* ============================================================
-   Contextual HUD — head-locked, appears only on gaze.
-   Compact, high-contrast, low in view so it never blocks sight.
+   Contextual HUD — head-locked, low, tilted up toward the eye.
    ============================================================ */
 AFRAME.registerComponent('gaze-hud', {
   init: function () {
@@ -420,7 +489,7 @@ AFRAME.registerComponent('gaze-hud', {
     this.panel.mesh.visible = false;
     this.el.object3D.add(this.panel.mesh);
     this.flashT = 0; this.flashOn = false; this.last = 0;
-    this.v = new THREE.Vector3();
+    this.v = new THREE.Vector3(); this.w = new THREE.Vector3();
   },
   flash: function (on) { this.flashT = 900; this.flashOn = on; },
   tick: function (time, dt) {
@@ -437,36 +506,24 @@ AFRAME.registerComponent('gaze-hud', {
   draw: function (g, prog, time) {
     const e = g.e, color = g.currentColor();
     const ctx = this.panel.ctx, cv = this.panel.cv, W = cv.width, H = cv.height;
-    const cam = this.el.sceneEl.camera;
-    let range = 0;
-    if (cam) {
-      cam.getWorldPosition(this.v);
-      range = this.v.distanceTo(g.orb.getWorldPosition(new THREE.Vector3()));
-    }
+    // TRUE range in metres: measured in the emitter's own (unscaled) space
+    const range = Math.hypot(e.pos[0], e.pos[2]);
     ctx.clearRect(0,0,W,H);
-    // high-contrast plate
-    ctx.fillStyle = 'rgba(2,10,7,0.90)';
-    roundRect(ctx,4,4,W-8,H-8,16); ctx.fill();
-    ctx.strokeStyle = color; ctx.lineWidth = 5; ctx.stroke();
-
+    ctx.fillStyle = 'rgba(2,10,7,0.92)';
+    roundRect(ctx,4,4,W-8,H-8,18); ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = 6; ctx.stroke();
     ctx.textBaseline='middle';
-    // header
     ctx.fillStyle = color; ctx.textAlign='left';
     ctx.font = 'bold ' + Math.round(H*0.155) + 'px ui-monospace, monospace';
     ctx.fillText(e.id, W*0.055, H*0.16);
     ctx.textAlign='right';
     ctx.fillText(Math.round(e.confidence*100) + '%', W*0.945, H*0.16);
-
     ctx.strokeStyle = color; ctx.globalAlpha=0.4; ctx.lineWidth=2;
     ctx.beginPath(); ctx.moveTo(W*0.055,H*0.27); ctx.lineTo(W*0.945,H*0.27); ctx.stroke();
     ctx.globalAlpha=1;
-
-    // class
     ctx.fillStyle = g.claimed ? CLAIM_COLOR : '#eafff6'; ctx.textAlign='left';
     ctx.font = 'bold ' + Math.round(H*0.115) + 'px ui-monospace, monospace';
     ctx.fillText(g.claimed ? 'HANDLED \u2713' : CLASSES[e.cls].name, W*0.055, H*0.40);
-
-    // big readable stats
     const hd = bearing(e.vel[0], e.vel[2]);
     const cols = [
       ['RANGE', Math.round(range) + 'm'],
@@ -481,8 +538,6 @@ AFRAME.registerComponent('gaze-hud', {
       ctx.fillStyle='#eafff6'; ctx.font='bold ' + Math.round(H*0.135) + 'px ui-monospace, monospace';
       ctx.fillText(cols[i][1], x, H*0.72);
     }
-
-    // claim progress / hint
     const by = H*0.87, bh = H*0.075, bx = W*0.055, bw = W*0.89;
     ctx.fillStyle='rgba(255,255,255,0.10)';
     roundRect(ctx,bx,by-bh/2,bw,bh,bh/2); ctx.fill();
@@ -507,44 +562,66 @@ AFRAME.registerComponent('gaze-hud', {
   }
 });
 
-/* ---------- status strip: anchor state, low in view ---------- */
+/* ============================================================
+   Status strip — big, centred, unmissable. A/X toggles.
+   ============================================================ */
 AFRAME.registerComponent('status-hud', {
   init: function () {
-    if (!CONFIG.debugHUD) { this.el.object3D.visible = false; return; }
-    this.panel = makeCanvasPanel(0.40, 0.055, 2600);
+    this.panel = makeCanvasPanel(0.50, 0.105, 2400);
     this.el.object3D.add(this.panel.mesh);
     this.v = new THREE.Vector3(); this.last = 0;
+    this._iq = new THREE.Quaternion();
   },
   tick: function (time) {
-    if (!CONFIG.debugHUD) return;
-    if (time - this.last < 200) return;
+    const S = window.RFX;
+    if (!S) return;
+    this.panel.mesh.visible = !!S.showStatus;
+    if (!S.showStatus) return;
+    if (time - this.last < 180) return;
     this.last = time;
-    const S = window.RFX, cam = this.el.sceneEl.camera;
+    const cam = this.el.sceneEl.camera;
     const worldEl = document.querySelector('#world');
     const al = worldEl && worldEl.components['anchor-lock'];
-    let hx='--', hz='--', anchor='OFF', track='\u2014';
+    let hx='--', hz='--', anchor='OFF', track='\u2014', n=0;
     if (cam && worldEl) {
+      // head position in the ANCHOR frame, independent of demo scale:
+      // undo translation+rotation only, never the scale factor.
       cam.getWorldPosition(this.v);
-      worldEl.object3D.worldToLocal(this.v);
-      hx = this.v.x.toFixed(1); hz = this.v.z.toFixed(1);
+      this.v.sub(worldEl.object3D.position);
+      this._iq.copy(worldEl.object3D.quaternion).invert();
+      this.v.applyQuaternion(this._iq);
+      hx = this.v.x.toFixed(2); hz = this.v.z.toFixed(2);
     }
     if (al) {
-      anchor = al.anchor ? 'LOCKED' : (S && S.isAR ? 'PENDING' : 'OFF');
+      anchor = al.anchor ? 'LOCKED' : (S.isAR ? 'PENDING' : 'OFF');
       track  = al.lastPoseOK ? 'OK' : (al.anchor ? 'LOST' : '\u2014');
+      n = al.anchorCount;
     }
+    this.draw(anchor, track, hx, hz, n, S.scale);
+  },
+  draw: function (anchor, track, hx, hz, n, scale) {
     const ctx=this.panel.ctx, cv=this.panel.cv, W=cv.width, H=cv.height;
+    const good = anchor==='LOCKED' && track==='OK';
+    const col = good ? '#2dffa0' : (anchor==='PENDING' ? '#ffb454' : '#ff5252');
     ctx.clearRect(0,0,W,H);
-    ctx.fillStyle='rgba(2,10,7,0.72)';
-    roundRect(ctx,2,2,W-4,H-4,8); ctx.fill();
-    ctx.strokeStyle = anchor==='LOCKED' ? 'rgba(45,255,160,.5)' : 'rgba(255,180,84,.6)';
-    ctx.lineWidth=2; ctx.stroke();
-    ctx.textBaseline='middle'; ctx.textAlign='left';
-    ctx.fillStyle = anchor==='LOCKED' ? '#2dffa0' : '#ffb454';
-    ctx.font='bold ' + Math.round(H*0.46) + 'px ui-monospace, monospace';
-    ctx.fillText('ANCHOR ' + anchor, W*0.03, H*0.5);
-    ctx.fillStyle='#7fae9c'; ctx.textAlign='right';
-    ctx.font=Math.round(H*0.40) + 'px ui-monospace, monospace';
-    ctx.fillText('TRK ' + track + '  HEAD ' + hx + '/' + hz + 'm', W*0.97, H*0.5);
+    ctx.fillStyle='rgba(2,10,7,0.90)';
+    roundRect(ctx,3,3,W-6,H-6,12); ctx.fill();
+    ctx.strokeStyle=col; ctx.lineWidth=4; ctx.stroke();
+    ctx.textBaseline='middle';
+    ctx.textAlign='left'; ctx.fillStyle=col;
+    ctx.font='bold ' + Math.round(H*0.30) + 'px ui-monospace, monospace';
+    ctx.fillText('ANCHOR ' + anchor, W*0.03, H*0.32);
+    ctx.fillStyle = track==='OK' ? '#2dffa0' : '#ff5252';
+    ctx.font='bold ' + Math.round(H*0.24) + 'px ui-monospace, monospace';
+    ctx.textAlign='right';
+    ctx.fillText('TRK ' + track + '  x' + n, W*0.97, H*0.32);
+    // the number that proves anchoring: head pos in anchored frame
+    ctx.textAlign='left'; ctx.fillStyle='#eafff6';
+    ctx.font='bold ' + Math.round(H*0.30) + 'px ui-monospace, monospace';
+    ctx.fillText('HEAD ' + hx + ' / ' + hz + ' m', W*0.03, H*0.72);
+    ctx.textAlign='right'; ctx.fillStyle='#39e0ff';
+    ctx.font='bold ' + Math.round(H*0.26) + 'px ui-monospace, monospace';
+    ctx.fillText('SCALE 1:' + Math.round(1/scale), W*0.97, H*0.72);
     this.panel.tex.needsUpdate = true;
   }
 });
@@ -557,16 +634,32 @@ AFRAME.registerComponent('tactical-grid', {
   }
 });
 
-/* ---------- recenter on controller grip / B / Y ---------- */
-AFRAME.registerComponent('recenter-input', {
+/* ---------- controller input: recenter, scale, status toggle ---------- */
+AFRAME.registerComponent('xr-input', {
   init: function () {
     const self = this;
+    // grip / B / Y -> recenter
     ['gripdown','bbuttondown','ybuttondown'].forEach(function (evt) {
       self.el.addEventListener(evt, function () {
         const w = document.querySelector('#world');
         const c = w && w.components['anchor-lock'];
         if (c) c.requestRecenter();
       });
+    });
+    // A / X -> toggle status strip
+    ['abuttondown','xbuttondown'].forEach(function (evt) {
+      self.el.addEventListener(evt, function () {
+        if (window.RFX) window.RFX.showStatus = !window.RFX.showStatus;
+      });
+    });
+    // thumbstick Y -> live world scale
+    this.el.addEventListener('thumbstickmoved', function (e) {
+      const S = window.RFX;
+      if (!S || !e.detail) return;
+      const y = e.detail.y;
+      if (Math.abs(y) < 0.15) return;
+      const f = 1 - y * 0.035;      // push up = shrink, pull down = grow
+      S.scale = Math.min(CONFIG.scaleMax, Math.max(CONFIG.scaleMin, S.scale * f));
     });
   }
 });
@@ -576,7 +669,7 @@ AFRAME.registerComponent('emitter-source', {
     const self = this;
     window.RFX = {
       playing:true, speed:1, beams:true, isAR:false, anchored:false,
-      gazed:null, claimProgress:0,
+      gazed:null, claimProgress:0, scale:CONFIG.scale, showStatus:CONFIG.showStatus,
       home: EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
     };
     EMITTERS.forEach(function (e,i) {
@@ -593,9 +686,9 @@ AFRAME.registerComponent('emitter-source', {
 <style>
   html,body{margin:0;width:100%;height:100%;background:#050807;font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
   #overlay{position:fixed;left:16px;top:16px;z-index:6;color:#2dffa0;background:rgba(4,16,12,.9);
-    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:352px}
+    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:360px}
   #overlay h1{margin:0 0 4px;font-size:14px;letter-spacing:1.5px}
-  #overlay p{margin:0 0 12px;font-size:11px;color:#7fae9c;line-height:1.6}
+  #overlay p{margin:0 0 12px;font-size:11px;color:#7fae9c;line-height:1.65}
   .btns{display:flex;gap:8px;margin-bottom:10px}
   .btns button{flex:1;padding:11px 8px;font-family:inherit;font-size:12px;letter-spacing:.5px;
     border-radius:7px;border:1px solid #2dffa0;background:rgba(45,255,160,.08);color:#2dffa0;cursor:pointer}
@@ -611,7 +704,8 @@ AFRAME.registerComponent('emitter-source', {
 <div id="overlay">
   <h1>RF EMITTER HIGHLIGHTER</h1>
   <p>Standalone Meta Quest Browser &mdash; not over Link.<br>
-     Gaze a beacon for details &middot; trigger or hold gaze to CLAIM &middot; grip/B/Y to recenter.</p>
+     <b>Gaze</b> a beacon for details &middot; <b>trigger</b> or hold gaze to CLAIM<br>
+     <b>Thumbstick up/down</b> scale world &middot; <b>grip/B/Y</b> recenter &middot; <b>A/X</b> hide status</p>
   <div class="btns">
     <button id="btn-ar" disabled>ENTER MIXED REALITY</button>
     <button id="btn-vr" disabled>ENTER VR</button>
@@ -630,19 +724,22 @@ AFRAME.registerComponent('emitter-source', {
   <a-plane id="ground" rotation="-90 0 0" width="300" height="300" color="#07110d" material="shader:flat"></a-plane>
   <a-entity id="grid" tactical-grid></a-entity>
 
-  <a-entity id="world" anchor-lock emitter-source></a-entity>
+  <!-- anchored + scaled world -->
+  <a-entity id="world" anchor-lock world-scale emitter-source>
+    <a-entity scan-field></a-entity>
+  </a-entity>
 
   <a-entity id="rig">
     <a-camera id="head" position="0 1.7 0" look-controls="pointerLockEnabled:false" wasd-controls="enabled:false">
-      <a-ring id="reticle" position="0 0 -1.2" radius-inner="0.005" radius-outer="0.009"
+      <a-ring id="reticle" position="0 -0.02 -1.2" radius-inner="0.005" radius-outer="0.009"
         color="#2dffa0" material="shader:flat; fog:false"></a-ring>
-      <!-- contextual readout: low in view, close, high contrast -->
-      <a-entity id="gaze-hud" gaze-hud position="0 -0.20 -0.72"></a-entity>
-      <!-- status strip: lower still, out of the way but readable -->
-      <a-entity status-hud position="0 -0.335 -0.72"></a-entity>
+      <!-- info box: low, tilted up toward the eye -->
+      <a-entity id="gaze-hud" gaze-hud position="0 -0.30 -0.70" rotation="14 0 0"></a-entity>
+      <!-- status: below it, same tilt, unmissable -->
+      <a-entity status-hud position="0 -0.45 -0.68" rotation="20 0 0"></a-entity>
     </a-camera>
-    <a-entity laser-controls="hand:left"  recenter-input></a-entity>
-    <a-entity laser-controls="hand:right" recenter-input></a-entity>
+    <a-entity laser-controls="hand:left"  xr-input></a-entity>
+    <a-entity laser-controls="hand:right" xr-input></a-entity>
   </a-entity>
 </a-scene>
 </body>
