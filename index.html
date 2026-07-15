@@ -8,17 +8,22 @@
 <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
 <script>
 /* ============================================================
-   RF Emitter Highlighter — passthrough + anchored world.
-   Emitters live under #world, which is locked to a WebXR anchor
-   so they stay welded to real locations as the user walks.
+   RF Emitter Highlighter — tactical build.
+   Passthrough MR, anchor-locked emitters, HUD-style contextual
+   readout, animated energy beams, claim/handled marking.
    ============================================================ */
-const CONFIG = { bg:'#050807', fogDensity:0.010, gazeFar:200, dwellMs:320, debugHUD:true };
+const CONFIG = {
+  bg:'#050807', fogDensity:0.010,
+  gazeFar:250, dwellMs:280, claimDwellMs:1400,
+  debugHUD:true
+};
 
 const CLASSES = {
   controller: { name:'DRONE CONTROLLER', color:'#2dffa0' },
   enemy:      { name:'ENEMY DRONE',      color:'#ff5252' },
   walkie:     { name:'WALKIE TALKIE',    color:'#5a82ff' }
 };
+const CLAIM_COLOR = '#ffb454';
 
 const EMITTERS = [
   { id:'EMT-007', cls:'controller', confidence:0.79, pos:[ 14,0,-22], vel:[ 0.35,0,-0.20] },
@@ -31,7 +36,7 @@ const COMPASS = ['N','NE','E','SE','S','SW','W','NW'];
 const bearing = (vx,vz) => { let d = Math.atan2(vx,-vz)*180/Math.PI; return d<0 ? d+360 : d; };
 const cardinal = d => COMPASS[Math.round(d/45)%8];
 
-/* ---------- crisp canvas labels ---------- */
+/* ---------- canvas panels ---------- */
 function makeCanvasPanel(w, h, pxPerMeter) {
   pxPerMeter = pxPerMeter || 220;
   const cv = document.createElement('canvas');
@@ -42,11 +47,12 @@ function makeCanvasPanel(w, h, pxPerMeter) {
   tex.anisotropy = 16;
   tex.minFilter = THREE.LinearMipmapLinearFilter;
   tex.magFilter = THREE.LinearFilter;
-  tex.generateMipmaps = true;
   const mesh = new THREE.Mesh(
     new THREE.PlaneGeometry(w, h),
-    new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthWrite:false, fog:false, toneMapped:false })
+    new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthWrite:false, depthTest:false,
+                                  fog:false, toneMapped:false })
   );
+  mesh.renderOrder = 999;
   return { cv:cv, ctx:ctx, tex:tex, mesh:mesh, w:w, h:h };
 }
 function roundRect(ctx,x,y,w,h,r){
@@ -54,55 +60,58 @@ function roundRect(ctx,x,y,w,h,r){
   ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
   ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
 }
-function drawTag(p, id, color) {
-  const ctx = p.ctx, cv = p.cv;
-  ctx.clearRect(0,0,cv.width,cv.height);
-  ctx.fillStyle = 'rgba(4,16,12,0.86)';
-  roundRect(ctx, 4,4, cv.width-8, cv.height-8, 14); ctx.fill();
-  ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.stroke();
-  ctx.fillStyle = color;
-  ctx.font = 'bold ' + Math.round(cv.height*0.46) + 'px ui-monospace, Menlo, Consolas, monospace';
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(id, cv.width/2, cv.height/2);
-  p.tex.needsUpdate = true;
-}
-function drawInfo(p, e, color) {
-  const ctx = p.ctx, cv = p.cv, W = cv.width, H = cv.height;
-  ctx.clearRect(0,0,W,H);
-  ctx.fillStyle = 'rgba(4,16,12,0.93)';
-  roundRect(ctx, 5,5, W-10, H-10, 18); ctx.fill();
-  ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.stroke();
-  const pad = W*0.07;
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = color;
-  ctx.font = 'bold ' + Math.round(H*0.11) + 'px ui-monospace, monospace';
-  ctx.textAlign = 'left';  ctx.fillText(e.id, pad, H*0.13);
-  ctx.textAlign = 'right'; ctx.fillText(Math.round(e.confidence*100) + '%', W-pad, H*0.13);
-  ctx.strokeStyle = color; ctx.globalAlpha = 0.45; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(pad,H*0.22); ctx.lineTo(W-pad,H*0.22); ctx.stroke();
-  ctx.globalAlpha = 1;
-  const hd = bearing(e.vel[0], e.vel[2]);
-  const rows = [
-    ['CLASS',     CLASSES[e.cls].name],
-    ['SPEED',     Math.hypot(e.vel[0],e.vel[2]).toFixed(1) + ' m/s'],
-    ['RANGE',     Math.round(Math.hypot(e.pos[0],e.pos[2])) + ' m'],
-    ['DIRECTION', Math.round(hd) + '\u00b0 ' + cardinal(hd)]
-  ];
-  for (let i=0;i<rows.length;i++){
-    const y = H*0.34 + i*H*0.16;
-    ctx.textAlign='left';
-    ctx.fillStyle = '#7fae9c';
-    ctx.font = Math.round(H*0.072) + 'px ui-monospace, monospace';
-    ctx.fillText(rows[i][0], pad, y);
-    ctx.fillStyle = '#eafff6';
-    ctx.font = 'bold ' + Math.round(H*0.085) + 'px ui-monospace, monospace';
-    ctx.textAlign='right'; ctx.fillText(rows[i][1], W-pad, y);
-  }
-  p.tex.needsUpdate = true;
+
+/* ============================================================
+   Animated energy-band beam shader.
+   Additive, scrolling bands + soft vertical falloff. No
+   postprocessing: reads as emitted light through passthrough
+   and costs one cheap fragment shader per beam.
+   ============================================================ */
+function makeBeamMaterial(colorHex) {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uColor:   { value: new THREE.Color(colorHex) },
+      uTime:    { value: 0 },
+      uActive:  { value: 0.0 },
+      uOpacity: { value: 0.85 }
+    },
+    vertexShader: [
+      'varying vec2 vUv;',
+      'void main() {',
+      '  vUv = uv;',
+      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 uColor;',
+      'uniform float uTime;',
+      'uniform float uActive;',
+      'uniform float uOpacity;',
+      'varying vec2 vUv;',
+      'void main() {',
+      // vertical falloff: bright at base, fading upward
+      '  float fade = pow(1.0 - vUv.y, 1.6);',
+      // scrolling energy bands
+      '  float bands = sin((vUv.y * 18.0) - uTime * 2.2);',
+      '  bands = smoothstep(0.55, 1.0, bands) * 0.55;',
+      // faster sweep pulse when focused
+      '  float sweep = smoothstep(0.90, 1.0, sin((vUv.y * 3.0) - uTime * (2.0 + uActive * 5.0)));',
+      // soft edges across the cylinder
+      '  float edge = sin(vUv.x * 3.14159);',
+      '  float a = (fade * (0.30 + bands + sweep * 0.7)) * edge;',
+      '  a *= uOpacity * (0.55 + uActive * 0.75);',
+      '  gl_FragColor = vec4(uColor * (1.0 + uActive * 0.6), a);',
+      '}'
+    ].join('\n')
+  });
 }
 
 /* ============================================================
-   XR session manager — explicit immersive-ar / immersive-vr.
+   XR session manager
    ============================================================ */
 AFRAME.registerComponent('xr-launcher', {
   init: function () {
@@ -113,13 +122,9 @@ AFRAME.registerComponent('xr-launcher', {
     this.arBtn = document.getElementById('btn-ar');
     this.vrBtn = document.getElementById('btn-vr');
     this.diag  = document.getElementById('diag');
-
     this.setWorld(true);
-
     const ready = () => { self.renderer = self.el.renderer; self.probe(); };
-    if (this.el.renderer) ready();
-    else this.el.addEventListener('loaded', ready);
-
+    if (this.el.renderer) ready(); else this.el.addEventListener('loaded', ready);
     this.arBtn.addEventListener('click', () => self.enter('immersive-ar'));
     this.vrBtn.addEventListener('click', () => self.enter('immersive-vr'));
     this.el.addEventListener('exit-vr', () => {
@@ -128,7 +133,6 @@ AFRAME.registerComponent('xr-launcher', {
       self.setWorld(true);
     });
   },
-
   probe: function () {
     const self = this;
     if (!navigator.xr) {
@@ -148,22 +152,18 @@ AFRAME.registerComponent('xr-launcher', {
       self.diag.className = ar ? 'ok' : 'warn';
     });
   },
-
   enter: function (mode) {
     const self = this;
     if (!navigator.xr || !this.renderer) return;
     const isAR = mode === 'immersive-ar';
     const opts = isAR
-      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','plane-detection','anchors'] }
+      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','anchors'] }
       : { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking'] };
-
     navigator.xr.requestSession(mode, opts).then((session) => {
       self.setWorld(!isAR);
       if (window.RFX) window.RFX.isAR = isAR;
       self.renderer.xr.setReferenceSpaceType('local-floor');
-      self.renderer.xr.setSession(session).then(() => {
-        document.body.classList.add('in-xr');
-      });
+      self.renderer.xr.setSession(session).then(() => document.body.classList.add('in-xr'));
       session.addEventListener('end', () => {
         document.body.classList.remove('in-xr');
         if (window.RFX) window.RFX.isAR = false;
@@ -174,7 +174,6 @@ AFRAME.registerComponent('xr-launcher', {
       self.diag.className = 'bad';
     });
   },
-
   setWorld: function (isDark) {
     const g = this.el.querySelector('#ground'), gr = this.el.querySelector('#grid');
     if (g)  g.setAttribute('visible', isDark);
@@ -182,34 +181,24 @@ AFRAME.registerComponent('xr-launcher', {
     this.el.object3D.background = isDark ? this.bgc : null;
     this.el.object3D.fog        = isDark ? this.fog : null;
     const r = this.el.renderer;
-    if (r) {
-      r.setClearColor(isDark ? this.bgc.getHex() : 0x000000, isDark ? 1 : 0);
-      r.setClearAlpha(isDark ? 1 : 0);
-    }
+    if (r) { r.setClearColor(isDark ? this.bgc.getHex() : 0x000000, isDark ? 1 : 0); r.setClearAlpha(isDark ? 1 : 0); }
     document.body.style.background = isDark ? CONFIG.bg : 'transparent';
   }
 });
 
 /* ============================================================
-   anchor-lock — welds #world to a real WebXR anchor.
-   The runtime drift-corrects the anchor, so children stay put
-   as the user walks. RECENTER re-drops the anchor under the
-   viewer, aligned to their heading (seed of Phase-B calibration).
-   Fails safe: if anchors are unavailable, #world stays at origin
-   and behaviour matches the un-anchored build.
+   anchor-lock — welds #world to a WebXR anchor.
+   NOTE: this is LOCAL drift-corrected anchoring, the ceiling on
+   this hardware. Quest has no GPS/compass, so true global
+   "absolute" coordinates are not obtainable here.
    ============================================================ */
 AFRAME.registerComponent('anchor-lock', {
   init: function () {
-    this.anchor = null;
-    this.pending = false;
-    this.recenterFlag = false;
-    this.world = this.el.object3D;
-    this._q = new THREE.Quaternion();
+    this.anchor = null; this.pending = false; this.recenterFlag = false;
+    this.world = this.el.object3D; this._q = new THREE.Quaternion();
     this.lastPoseOK = false;
   },
-
   requestRecenter: function () { this.recenterFlag = true; },
-
   _makeAnchor: function (frame, refSpace, xform) {
     const self = this, old = this.anchor;
     this.pending = true;
@@ -221,36 +210,27 @@ AFRAME.registerComponent('anchor-lock', {
       }).catch(function () { self.pending = false; });
     } catch (e) { self.pending = false; }
   },
-
   tick: function () {
     const S = window.RFX;
     if (!S || !S.isAR) return;
-    const scene = this.el.sceneEl;
-    const frame = scene.frame, r = scene.renderer;
+    const scene = this.el.sceneEl, frame = scene.frame, r = scene.renderer;
     if (!frame || !r || !r.xr || !frame.createAnchor) return;
     const refSpace = r.xr.getReferenceSpace();
     if (!refSpace) return;
-
     if (this.recenterFlag) {
       this.recenterFlag = false;
       const vp = frame.getViewerPose(refSpace);
       if (vp) {
         const t = vp.transform;
         this._q.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
-        const e = new THREE.Euler().setFromQuaternion(this._q, 'YXZ');   // yaw-only
+        const e = new THREE.Euler().setFromQuaternion(this._q, 'YXZ');
         const yq = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, e.y, 0));
-        const xform = new XRRigidTransform(
+        this._makeAnchor(frame, refSpace, new XRRigidTransform(
           { x: t.position.x, y: 0, z: t.position.z },
-          { x: yq.x, y: yq.y, z: yq.z, w: yq.w }
-        );
-        this._makeAnchor(frame, refSpace, xform);
+          { x: yq.x, y: yq.y, z: yq.z, w: yq.w }));
       }
     }
-
-    if (!this.anchor && !this.pending) {
-      this._makeAnchor(frame, refSpace, new XRRigidTransform());
-    }
-
+    if (!this.anchor && !this.pending) this._makeAnchor(frame, refSpace, new XRRigidTransform());
     if (this.anchor) {
       const pose = frame.getPose(this.anchor.anchorSpace, refSpace);
       this.lastPoseOK = !!pose;
@@ -259,115 +239,93 @@ AFRAME.registerComponent('anchor-lock', {
         this.world.position.set(p.x, p.y, p.z);
         this.world.quaternion.set(o.x, o.y, o.z, o.w);
       }
-    } else {
-      this.lastPoseOK = false;
-    }
+    } else this.lastPoseOK = false;
   }
 });
 
-/* ---------- head-locked status HUD (verify anchoring) ----------
-   Shows head position in the ANCHORED frame. Walk to a spot, note
-   the numbers, walk away and back: same numbers = beams are fixed.
-   Set CONFIG.debugHUD=false to hide for a clean demo. */
-AFRAME.registerComponent('status-hud', {
-  init: function () {
-    if (!CONFIG.debugHUD) { this.el.object3D.visible = false; return; }
-    this.panel = makeCanvasPanel(0.34, 0.14, 700);
-    this.el.object3D.add(this.panel.mesh);
-    this.v = new THREE.Vector3();
-    this.last = 0;
-  },
-  tick: function (time) {
-    if (!CONFIG.debugHUD) return;
-    if (time - this.last < 150) return;
-    this.last = time;
-    const S = window.RFX, scene = this.el.sceneEl, cam = scene.camera;
-    const worldEl = document.querySelector('#world');
-    const al = worldEl && worldEl.components['anchor-lock'];
-    let hx = '--', hz = '--', anchor = 'OFF', track = '\u2014';
-    if (cam && worldEl) {
-      cam.getWorldPosition(this.v);
-      worldEl.object3D.worldToLocal(this.v);
-      hx = this.v.x.toFixed(1); hz = this.v.z.toFixed(1);
-    }
-    if (al) {
-      anchor = al.anchor ? 'LOCKED' : (S && S.isAR ? 'PENDING' : 'OFF');
-      track  = al.lastPoseOK ? 'OK' : (al.anchor ? 'LOST' : '\u2014');
-    }
-    this.draw(anchor, track, hx, hz);
-  },
-  draw: function (anchor, track, hx, hz) {
-    const ctx = this.panel.ctx, cv = this.panel.cv, W = cv.width, H = cv.height;
-    ctx.clearRect(0,0,W,H);
-    ctx.fillStyle = 'rgba(4,16,12,0.82)';
-    roundRect(ctx,3,3,W-6,H-6,12); ctx.fill();
-    ctx.strokeStyle = anchor === 'LOCKED' ? '#2dffa0' : '#ffb454';
-    ctx.lineWidth = 3; ctx.stroke();
-    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-    ctx.fillStyle = anchor === 'LOCKED' ? '#2dffa0' : '#ffb454';
-    ctx.font = 'bold ' + Math.round(H*0.20) + 'px ui-monospace, monospace';
-    ctx.fillText('ANCHOR ' + anchor, W*0.06, H*0.30);
-    ctx.fillStyle = '#7fae9c';
-    ctx.font = Math.round(H*0.16) + 'px ui-monospace, monospace';
-    ctx.fillText('TRACK ' + track + '   HEAD ' + hx + ' / ' + hz + ' m', W*0.06, H*0.68);
-    this.panel.tex.needsUpdate = true;
-  }
-});
-
-/* ---------- emitter marker ---------- */
+/* ============================================================
+   Emitter marker — energy beam, lock-on shell, claim state.
+   ============================================================ */
 AFRAME.registerComponent('rf-emitter', {
   schema: { idx:{type:'int', default:0} },
   init: function () {
     const e = this.e = EMITTERS[this.data.idx];
-    const color = this.color = CLASSES[e.cls].color;
-    const c3 = new THREE.Color(color);
+    this.baseColor = CLASSES[e.cls].color;
+    this.claimed = false;
     const root = this.el.object3D;
-    const mat = function (o, add) {
-      return new THREE.MeshBasicMaterial({
-        color:c3, transparent:true, opacity:o, fog:false, depthWrite:false, toneMapped:false,
-        blending: add ? THREE.AdditiveBlending : THREE.NormalBlending
-      });
-    };
-    this.beam = new THREE.Mesh(new THREE.CylinderGeometry(0.30,0.30,34,10,1,true), mat(0.15,true));
-    this.beam.position.y = 17; root.add(this.beam);
-    this.core = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,34,6,1,true), mat(0.70,true));
-    this.core.position.y = 17; root.add(this.core);
-    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.25,1.55,48), mat(0.9,false));
+    const c3 = new THREE.Color(this.baseColor);
+
+    // animated energy beam
+    this.beamMat = makeBeamMaterial(this.baseColor);
+    this.beam = new THREE.Mesh(new THREE.CylinderGeometry(0.34,0.34,30,12,1,true), this.beamMat);
+    this.beam.position.y = 15; root.add(this.beam);
+
+    const add = (o) => new THREE.MeshBasicMaterial({
+      color:c3, transparent:true, opacity:o, fog:false, depthWrite:false,
+      toneMapped:false, blending:THREE.AdditiveBlending });
+
+    // ground rings
+    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.15,1.45,44), add(0.85));
     this.ring.material.side = THREE.DoubleSide;
     this.ring.rotation.x = -Math.PI/2; this.ring.position.y = 0.03; root.add(this.ring);
-    this.pulse = new THREE.Mesh(new THREE.RingGeometry(0.85,1.05,48), mat(0.7,true));
+    this.pulse = new THREE.Mesh(new THREE.RingGeometry(0.8,1.0,44), add(0.6));
     this.pulse.material.side = THREE.DoubleSide;
     this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
-    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.55,20,16), mat(1.0,false));
-    this.orb.position.y = 2.8; root.add(this.orb);
-    this.halo = new THREE.Mesh(new THREE.SphereGeometry(0.95,16,12), mat(0.18,true));
-    this.halo.position.y = 2.8; root.add(this.halo);
-    this.tag = makeCanvasPanel(2.6, 0.62, 260);
-    drawTag(this.tag, e.id, color);
-    this.tag.mesh.position.set(0, 4.15, 0); root.add(this.tag.mesh);
-    this.info = makeCanvasPanel(3.4, 2.4, 260);
-    drawInfo(this.info, e, color);
-    this.info.mesh.position.set(0, 6.4, 0);
-    this.info.mesh.visible = false; root.add(this.info.mesh);
+
+    // core orb (raycast target) + fake-bloom halo sprite
+    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.5,20,16),
+      new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false }));
+    this.orb.position.y = 2.6; root.add(this.orb);
+    this.halo = new THREE.Mesh(new THREE.SphereGeometry(0.85,16,12), add(0.22));
+    this.halo.position.y = 2.6; root.add(this.halo);
+
+    // rotating lock-on shell
+    this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.05, 1),
+      new THREE.MeshBasicMaterial({ color:c3, wireframe:true, transparent:true,
+        opacity:0.30, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
+    this.shell.position.y = 2.6; root.add(this.shell);
+
+    // claim marker (hidden until claimed)
+    this.claimRing = new THREE.Mesh(new THREE.TorusGeometry(1.35, 0.06, 8, 40),
+      new THREE.MeshBasicMaterial({ color:new THREE.Color(CLAIM_COLOR), transparent:true,
+        opacity:0.9, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
+    this.claimRing.rotation.x = -Math.PI/2; this.claimRing.position.y = 0.12;
+    this.claimRing.visible = false; root.add(this.claimRing);
+
     this.phase = Math.random()*1800;
     this.focused = false;
     this.tmp = new THREE.Vector3();
-    this.lastDraw = 0;
   },
+
   setFocused: function (f) {
     if (this.focused === f) return;
     this.focused = f;
-    this.info.mesh.visible = f;
-    this.beam.material.opacity = f ? 0.34 : 0.15;
-    this.core.material.opacity = f ? 1.0  : 0.70;
-    this.ring.material.opacity = f ? 1.0  : 0.90;
-    this.orb.scale.setScalar(f ? 1.25 : 1.0);
+    this.beamMat.uniforms.uActive.value = f ? 1.0 : 0.0;
+    this.orb.scale.setScalar(f ? 1.3 : 1.0);
+    this.shell.material.opacity = f ? 0.7 : 0.30;
   },
+
+  toggleClaim: function () {
+    this.claimed = !this.claimed;
+    this.claimRing.visible = this.claimed;
+    const c = new THREE.Color(this.claimed ? CLAIM_COLOR : this.baseColor);
+    this.beamMat.uniforms.uColor.value.copy(c);
+    this.orb.material.color.copy(c);
+    this.halo.material.color.copy(c);
+    this.shell.material.color.copy(c);
+    this.ring.material.color.copy(c);
+    this.pulse.material.color.copy(c);
+    return this.claimed;
+  },
+
+  currentColor: function () { return this.claimed ? CLAIM_COLOR : this.baseColor; },
+
   tick: function (time, dt) {
     const S = window.RFX;
     if (!S) return;
     const e = this.e, root = this.el.object3D;
     const step = Math.min(dt || 16, 50) / 1000;
+
     if (S.playing) {
       e.pos[0] += e.vel[0] * step * S.speed;
       e.pos[2] += e.vel[2] * step * S.speed;
@@ -376,50 +334,53 @@ AFRAME.registerComponent('rf-emitter', {
       if (Math.hypot(e.pos[0], e.pos[2]) > 75) { e.vel[0]*=-1; e.vel[2]*=-1; }
       root.position.set(e.pos[0], 0, e.pos[2]);
     }
+
+    this.beamMat.uniforms.uTime.value = time * 0.001;
+    this.beam.visible = S.beams;
+
     const t = ((time + this.phase) % 1800) / 1800;
-    const s = 1 + t*4.2;
+    const s = 1 + t*4.0;
     this.pulse.scale.set(s,1,s);
-    this.pulse.material.opacity = 0.65 * (1 - t);
-    this.orb.position.y = this.halo.position.y = 2.8 + Math.sin(time*0.0015 + this.phase)*0.12;
-    const cam = this.el.sceneEl.camera;
-    if (cam) {
-      cam.getWorldPosition(this.tmp);
-      this.tag.mesh.lookAt(this.tmp);
-      const d = this.tmp.distanceTo(this.tag.mesh.getWorldPosition(new THREE.Vector3()));
-      const k = Math.max(1, d/14);
-      this.tag.mesh.scale.setScalar(k);
-      this.tag.mesh.position.y = 4.15 + k*0.35;
-      if (this.focused) {
-        this.info.mesh.lookAt(this.tmp);
-        this.info.mesh.scale.setScalar(k);
-        this.info.mesh.position.y = 5.6 + k*1.15;
-        if (S.playing && time - this.lastDraw > 250) {
-          drawInfo(this.info, e, this.color);
-          this.lastDraw = time;
-        }
-      }
+    this.pulse.material.opacity = 0.6 * (1 - t);
+    const bob = 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
+    this.orb.position.y = this.halo.position.y = this.shell.position.y = bob;
+    this.shell.rotation.y += step * (this.focused ? 1.1 : 0.35);
+    this.shell.rotation.x += step * 0.15;
+    if (this.claimed) {
+      this.claimRing.rotation.z += step * 0.8;
+      this.claimRing.material.opacity = 0.65 + Math.sin(time*0.004)*0.25;
     }
-    this.beam.visible = this.core.visible = S.beams;
   }
 });
 
-/* ---------- gaze with dwell ---------- */
+/* ============================================================
+   Gaze + claim. Dwell to focus; longer dwell OR trigger to claim.
+   ============================================================ */
 AFRAME.registerComponent('gaze-picker', {
   init: function () {
     const self = this;
-    this.ray = new THREE.Raycaster();
-    this.ray.far = CONFIG.gazeFar;
-    this.origin = new THREE.Vector3();
-    this.dir = new THREE.Vector3();
+    this.ray = new THREE.Raycaster(); this.ray.far = CONFIG.gazeFar;
+    this.origin = new THREE.Vector3(); this.dir = new THREE.Vector3();
     this.current = null; this.candidate = null; this.since = 0;
-    this.comps = []; this.orbs = [];
+    this.claimArmed = 0; this.comps = []; this.orbs = [];
     this.el.addEventListener('targets-ready', function () {
-      self.comps = Array.prototype.map.call(
-        document.querySelectorAll('[rf-emitter]'), function (el) { return el.components['rf-emitter']; });
+      self.comps = Array.prototype.map.call(document.querySelectorAll('[rf-emitter]'),
+        function (el) { return el.components['rf-emitter']; });
       self.orbs = self.comps.map(function (c) { return c.orb; });
     });
+    // controller trigger claims whatever is gazed
+    ['triggerdown','abuttondown','xbuttondown'].forEach(function (evt) {
+      self.el.addEventListener(evt, function () { self.claim(); });
+    });
   },
-  tick: function (time) {
+  claim: function () {
+    if (!this.current) return;
+    const on = this.current.toggleClaim();
+    const hud = document.querySelector('#gaze-hud');
+    if (hud && hud.components['gaze-hud']) hud.components['gaze-hud'].flash(on);
+    this.claimArmed = 0;
+  },
+  tick: function (time, dt) {
     const cam = this.el.camera;
     if (!cam || !this.orbs.length) return;
     cam.getWorldPosition(this.origin);
@@ -431,102 +392,159 @@ AFRAME.registerComponent('gaze-picker', {
       const obj = hits[0].object;
       for (let i=0;i<this.comps.length;i++) if (this.comps[i].orb === obj) { comp = this.comps[i]; break; }
     }
-    if (comp !== this.candidate) { this.candidate = comp; this.since = time; }
-    const reticle = document.querySelector('#reticle');
+    if (comp !== this.candidate) { this.candidate = comp; this.since = time; this.claimArmed = 0; }
     if (comp && (time - this.since > CONFIG.dwellMs) && comp !== this.current) {
       if (this.current) this.current.setFocused(false);
-      comp.setFocused(true); this.current = comp;
-      if (reticle) reticle.setAttribute('material','color: ' + comp.color);
+      comp.setFocused(true); this.current = comp; this.claimArmed = 0;
     }
-    if (!comp && this.current) {
-      this.current.setFocused(false); this.current = null;
-      if (reticle) reticle.setAttribute('material','color: #2dffa0');
+    if (!comp && this.current) { this.current.setFocused(false); this.current = null; this.claimArmed = 0; }
+
+    // gaze-dwell claim
+    if (this.current && comp === this.current) {
+      this.claimArmed += (dt || 16);
+      if (this.claimArmed > CONFIG.claimDwellMs + CONFIG.dwellMs) this.claim();
     }
+    window.RFX.gazed = this.current;
+    window.RFX.claimProgress = this.current
+      ? Math.min(1, Math.max(0, (this.claimArmed - CONFIG.dwellMs) / CONFIG.claimDwellMs)) : 0;
   }
 });
 
-/* ---------- in-XR control panel ---------- */
-AFRAME.registerComponent('control-panel', {
+/* ============================================================
+   Contextual HUD — head-locked, appears only on gaze.
+   Compact, high-contrast, low in view so it never blocks sight.
+   ============================================================ */
+AFRAME.registerComponent('gaze-hud', {
   init: function () {
-    const self = this;
-    const root = this.el.object3D;
-    this.panel = makeCanvasPanel(0.82, 0.56, 700);
-    root.add(this.panel.mesh);
-
-    this.ITEMS = [
-      ['playing','SIMULATION'],
-      ['speed','SPEED'],
-      ['beams','BEAMS'],
-      ['recenter','RECENTER'],
-      ['reset','RESET']
-    ];
-    this.ROWF = [0.30, 0.435, 0.57, 0.705, 0.84];
-
-    const self2 = this;
-    this.ITEMS.forEach(function (it, i) {
-      const yy = 0.28 - self2.ROWF[i]*0.56;
-      const hp = new THREE.Mesh(
-        new THREE.PlaneGeometry(0.74, 0.066),
-        new THREE.MeshBasicMaterial({ visible:false })
-      );
-      hp.position.set(0, yy, 0.004);
-      const holder = document.createElement('a-entity');
-      holder.classList.add('ui');
-      self.el.appendChild(holder);
-      holder.setObject3D('hit', hp);
-      holder.addEventListener('click', function () { self.hit(it[0]); });
-    });
-    setTimeout(function(){ self.render(); }, 50);
+    this.panel = makeCanvasPanel(0.46, 0.26, 2200);
+    this.panel.mesh.visible = false;
+    this.el.object3D.add(this.panel.mesh);
+    this.flashT = 0; this.flashOn = false; this.last = 0;
+    this.v = new THREE.Vector3();
   },
-  hit: function (key) {
-    const S = window.RFX;
-    if (key === 'playing') S.playing = !S.playing;
-    else if (key === 'beams') S.beams = !S.beams;
-    else if (key === 'speed') S.speed = S.speed >= 4 ? 0.5 : S.speed*2;
-    else if (key === 'recenter') {
-      const w = document.querySelector('#world');
-      const c = w && w.components['anchor-lock'];
-      if (c) c.requestRecenter();
-    }
-    else if (key === 'reset') {
-      for (let i=0;i<EMITTERS.length;i++){
-        EMITTERS[i].pos = S.home[i].pos.slice();
-        EMITTERS[i].vel = S.home[i].vel.slice();
-      }
-      S.speed = 1; S.playing = true; S.beams = true;
-    }
-    this.render();
-  },
-  render: function () {
+  flash: function (on) { this.flashT = 900; this.flashOn = on; },
+  tick: function (time, dt) {
     const S = window.RFX;
     if (!S) return;
-    const ctx = this.panel.ctx, cv = this.panel.cv;
-    ctx.clearRect(0,0,cv.width,cv.height);
-    ctx.fillStyle = 'rgba(4,16,12,0.94)';
-    roundRect(ctx,4,4,cv.width-8,cv.height-8,16); ctx.fill();
-    ctx.strokeStyle = '#2dffa0'; ctx.lineWidth = 3; ctx.stroke();
-    ctx.textBaseline='middle';
-    ctx.fillStyle='#2dffa0'; ctx.textAlign='center';
-    ctx.font = 'bold ' + Math.round(cv.height*0.078) + 'px ui-monospace, monospace';
-    ctx.fillText('CONTROLS', cv.width/2, cv.height*0.11);
+    if (this.flashT > 0) this.flashT -= (dt || 16);
+    const g = S.gazed;
+    this.panel.mesh.visible = !!g || this.flashT > 0;
+    if (!this.panel.mesh.visible) return;
+    if (time - this.last < 90) return;
+    this.last = time;
+    if (g) this.draw(g, S.claimProgress, time);
+  },
+  draw: function (g, prog, time) {
+    const e = g.e, color = g.currentColor();
+    const ctx = this.panel.ctx, cv = this.panel.cv, W = cv.width, H = cv.height;
+    const cam = this.el.sceneEl.camera;
+    let range = 0;
+    if (cam) {
+      cam.getWorldPosition(this.v);
+      range = this.v.distanceTo(g.orb.getWorldPosition(new THREE.Vector3()));
+    }
+    ctx.clearRect(0,0,W,H);
+    // high-contrast plate
+    ctx.fillStyle = 'rgba(2,10,7,0.90)';
+    roundRect(ctx,4,4,W-8,H-8,16); ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = 5; ctx.stroke();
 
-    const vals = {
-      playing:[S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454'],
-      speed:  [S.speed+'x', '#39e0ff'],
-      beams:  [S.beams?'ON':'OFF', S.beams?'#2dffa0':'#7fae9c'],
-      recenter:['TAP', '#39e0ff'],
-      reset:  ['TAP', '#ff5252']
-    };
-    const self = this;
-    this.ITEMS.forEach(function (it, i) {
-      const y = cv.height*self.ROWF[i];
-      const v = vals[it[0]];
-      ctx.font = Math.round(cv.height*0.064) + 'px ui-monospace, monospace';
-      ctx.textAlign='left';  ctx.fillStyle='#7fae9c'; ctx.fillText(it[1], cv.width*0.09, y);
-      ctx.textAlign='right'; ctx.fillStyle=v[1];
-      ctx.font = 'bold ' + Math.round(cv.height*0.068) + 'px ui-monospace, monospace';
-      ctx.fillText(v[0], cv.width*0.91, y);
-    });
+    ctx.textBaseline='middle';
+    // header
+    ctx.fillStyle = color; ctx.textAlign='left';
+    ctx.font = 'bold ' + Math.round(H*0.155) + 'px ui-monospace, monospace';
+    ctx.fillText(e.id, W*0.055, H*0.16);
+    ctx.textAlign='right';
+    ctx.fillText(Math.round(e.confidence*100) + '%', W*0.945, H*0.16);
+
+    ctx.strokeStyle = color; ctx.globalAlpha=0.4; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(W*0.055,H*0.27); ctx.lineTo(W*0.945,H*0.27); ctx.stroke();
+    ctx.globalAlpha=1;
+
+    // class
+    ctx.fillStyle = g.claimed ? CLAIM_COLOR : '#eafff6'; ctx.textAlign='left';
+    ctx.font = 'bold ' + Math.round(H*0.115) + 'px ui-monospace, monospace';
+    ctx.fillText(g.claimed ? 'HANDLED \u2713' : CLASSES[e.cls].name, W*0.055, H*0.40);
+
+    // big readable stats
+    const hd = bearing(e.vel[0], e.vel[2]);
+    const cols = [
+      ['RANGE', Math.round(range) + 'm'],
+      ['SPEED', Math.hypot(e.vel[0],e.vel[2]).toFixed(1)],
+      ['BRG',   Math.round(hd) + '\u00b0' + cardinal(hd)]
+    ];
+    for (let i=0;i<3;i++){
+      const x = W*(0.19 + i*0.31);
+      ctx.textAlign='center';
+      ctx.fillStyle='#7fae9c'; ctx.font = Math.round(H*0.082) + 'px ui-monospace, monospace';
+      ctx.fillText(cols[i][0], x, H*0.585);
+      ctx.fillStyle='#eafff6'; ctx.font='bold ' + Math.round(H*0.135) + 'px ui-monospace, monospace';
+      ctx.fillText(cols[i][1], x, H*0.72);
+    }
+
+    // claim progress / hint
+    const by = H*0.87, bh = H*0.075, bx = W*0.055, bw = W*0.89;
+    ctx.fillStyle='rgba(255,255,255,0.10)';
+    roundRect(ctx,bx,by-bh/2,bw,bh,bh/2); ctx.fill();
+    if (this.flashT > 0) {
+      ctx.fillStyle = this.flashOn ? CLAIM_COLOR : '#7fae9c';
+      roundRect(ctx,bx,by-bh/2,bw,bh,bh/2); ctx.fill();
+      ctx.fillStyle='#02120c'; ctx.textAlign='center';
+      ctx.font='bold ' + Math.round(H*0.072) + 'px ui-monospace, monospace';
+      ctx.fillText(this.flashOn ? 'CLAIMED' : 'RELEASED', W/2, by);
+    } else if (prog > 0.01) {
+      ctx.fillStyle = CLAIM_COLOR;
+      roundRect(ctx,bx,by-bh/2,Math.max(bh,bw*prog),bh,bh/2); ctx.fill();
+      ctx.fillStyle='#7fae9c'; ctx.textAlign='center';
+      ctx.font=Math.round(H*0.068) + 'px ui-monospace, monospace';
+      ctx.fillText('HOLD GAZE TO ' + (g.claimed ? 'RELEASE' : 'CLAIM'), W/2, by - bh);
+    } else {
+      ctx.fillStyle='#5c7d70'; ctx.textAlign='center';
+      ctx.font=Math.round(H*0.068) + 'px ui-monospace, monospace';
+      ctx.fillText('TRIGGER OR HOLD GAZE TO ' + (g.claimed ? 'RELEASE' : 'CLAIM'), W/2, by);
+    }
+    this.panel.tex.needsUpdate = true;
+  }
+});
+
+/* ---------- status strip: anchor state, low in view ---------- */
+AFRAME.registerComponent('status-hud', {
+  init: function () {
+    if (!CONFIG.debugHUD) { this.el.object3D.visible = false; return; }
+    this.panel = makeCanvasPanel(0.40, 0.055, 2600);
+    this.el.object3D.add(this.panel.mesh);
+    this.v = new THREE.Vector3(); this.last = 0;
+  },
+  tick: function (time) {
+    if (!CONFIG.debugHUD) return;
+    if (time - this.last < 200) return;
+    this.last = time;
+    const S = window.RFX, cam = this.el.sceneEl.camera;
+    const worldEl = document.querySelector('#world');
+    const al = worldEl && worldEl.components['anchor-lock'];
+    let hx='--', hz='--', anchor='OFF', track='\u2014';
+    if (cam && worldEl) {
+      cam.getWorldPosition(this.v);
+      worldEl.object3D.worldToLocal(this.v);
+      hx = this.v.x.toFixed(1); hz = this.v.z.toFixed(1);
+    }
+    if (al) {
+      anchor = al.anchor ? 'LOCKED' : (S && S.isAR ? 'PENDING' : 'OFF');
+      track  = al.lastPoseOK ? 'OK' : (al.anchor ? 'LOST' : '\u2014');
+    }
+    const ctx=this.panel.ctx, cv=this.panel.cv, W=cv.width, H=cv.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='rgba(2,10,7,0.72)';
+    roundRect(ctx,2,2,W-4,H-4,8); ctx.fill();
+    ctx.strokeStyle = anchor==='LOCKED' ? 'rgba(45,255,160,.5)' : 'rgba(255,180,84,.6)';
+    ctx.lineWidth=2; ctx.stroke();
+    ctx.textBaseline='middle'; ctx.textAlign='left';
+    ctx.fillStyle = anchor==='LOCKED' ? '#2dffa0' : '#ffb454';
+    ctx.font='bold ' + Math.round(H*0.46) + 'px ui-monospace, monospace';
+    ctx.fillText('ANCHOR ' + anchor, W*0.03, H*0.5);
+    ctx.fillStyle='#7fae9c'; ctx.textAlign='right';
+    ctx.font=Math.round(H*0.40) + 'px ui-monospace, monospace';
+    ctx.fillText('TRK ' + track + '  HEAD ' + hx + '/' + hz + 'm', W*0.97, H*0.5);
     this.panel.tex.needsUpdate = true;
   }
 });
@@ -539,12 +557,26 @@ AFRAME.registerComponent('tactical-grid', {
   }
 });
 
-/* ---------- spawn emitters into #world ---------- */
+/* ---------- recenter on controller grip / B / Y ---------- */
+AFRAME.registerComponent('recenter-input', {
+  init: function () {
+    const self = this;
+    ['gripdown','bbuttondown','ybuttondown'].forEach(function (evt) {
+      self.el.addEventListener(evt, function () {
+        const w = document.querySelector('#world');
+        const c = w && w.components['anchor-lock'];
+        if (c) c.requestRecenter();
+      });
+    });
+  }
+});
+
 AFRAME.registerComponent('emitter-source', {
   init: function () {
     const self = this;
     window.RFX = {
       playing:true, speed:1, beams:true, isAR:false, anchored:false,
+      gazed:null, claimProgress:0,
       home: EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
     };
     EMITTERS.forEach(function (e,i) {
@@ -561,7 +593,7 @@ AFRAME.registerComponent('emitter-source', {
 <style>
   html,body{margin:0;width:100%;height:100%;background:#050807;font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
   #overlay{position:fixed;left:16px;top:16px;z-index:6;color:#2dffa0;background:rgba(4,16,12,.9);
-    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:344px}
+    border:1px solid rgba(45,255,160,.4);padding:14px 16px;border-radius:9px;max-width:352px}
   #overlay h1{margin:0 0 4px;font-size:14px;letter-spacing:1.5px}
   #overlay p{margin:0 0 12px;font-size:11px;color:#7fae9c;line-height:1.6}
   .btns{display:flex;gap:8px;margin-bottom:10px}
@@ -570,9 +602,7 @@ AFRAME.registerComponent('emitter-source', {
   .btns button:disabled{opacity:.35;border-color:#3a5b50;color:#5c7d70;cursor:not-allowed}
   .btns button.on{box-shadow:0 0 14px rgba(45,255,160,.35)}
   #diag{font-size:11px;line-height:1.6;border-top:1px solid rgba(45,255,160,.25);padding-top:9px}
-  #diag.ok{color:#2dffa0}
-  #diag.warn{color:#ffb454}
-  #diag.bad{color:#ff5252}
+  #diag.ok{color:#2dffa0} #diag.warn{color:#ffb454} #diag.bad{color:#ff5252}
   .in-xr #overlay{display:none}
 </style>
 </head>
@@ -580,7 +610,8 @@ AFRAME.registerComponent('emitter-source', {
 <body>
 <div id="overlay">
   <h1>RF EMITTER HIGHLIGHTER</h1>
-  <p>Standalone Meta Quest Browser &mdash; not over Link. Gaze an orb to inspect; point &amp; trigger the panel. Tap RECENTER to drop the field where you stand.</p>
+  <p>Standalone Meta Quest Browser &mdash; not over Link.<br>
+     Gaze a beacon for details &middot; trigger or hold gaze to CLAIM &middot; grip/B/Y to recenter.</p>
   <div class="btns">
     <button id="btn-ar" disabled>ENTER MIXED REALITY</button>
     <button id="btn-vr" disabled>ENTER VR</button>
@@ -599,18 +630,19 @@ AFRAME.registerComponent('emitter-source', {
   <a-plane id="ground" rotation="-90 0 0" width="300" height="300" color="#07110d" material="shader:flat"></a-plane>
   <a-entity id="grid" tactical-grid></a-entity>
 
-  <!-- everything under #world is anchor-locked to the real space -->
   <a-entity id="world" anchor-lock emitter-source></a-entity>
 
   <a-entity id="rig">
     <a-camera id="head" position="0 1.7 0" look-controls="pointerLockEnabled:false" wasd-controls="enabled:false">
-      <a-ring id="reticle" position="0 0 -1.2" radius-inner="0.006" radius-outer="0.010"
+      <a-ring id="reticle" position="0 0 -1.2" radius-inner="0.005" radius-outer="0.009"
         color="#2dffa0" material="shader:flat; fog:false"></a-ring>
-      <a-entity control-panel position="-0.42 -0.28 -0.95" rotation="-18 20 0"></a-entity>
-      <a-entity status-hud position="0 0.22 -0.8"></a-entity>
+      <!-- contextual readout: low in view, close, high contrast -->
+      <a-entity id="gaze-hud" gaze-hud position="0 -0.20 -0.72"></a-entity>
+      <!-- status strip: lower still, out of the way but readable -->
+      <a-entity status-hud position="0 -0.335 -0.72"></a-entity>
     </a-camera>
-    <a-entity laser-controls="hand:left"  raycaster="objects:.ui; far:6"></a-entity>
-    <a-entity laser-controls="hand:right" raycaster="objects:.ui; far:6"></a-entity>
+    <a-entity laser-controls="hand:left"  recenter-input></a-entity>
+    <a-entity laser-controls="hand:right" recenter-input></a-entity>
   </a-entity>
 </a-scene>
 </body>
