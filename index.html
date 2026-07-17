@@ -25,7 +25,12 @@ const CONFIG = {
 const CLASSES = {
   controller: { name:'DRONE CONTROLLER', color:'#2dffa0' },
   enemy:      { name:'ENEMY DRONE',      color:'#ff5252' },
-  walkie:     { name:'WALKIE TALKIE',    color:'#5a82ff' }
+  walkie:     { name:'WALKIE TALKIE',    color:'#5a82ff' },
+  jammer:     { name:'RF JAMMER',        color:'#ff4df0' },
+  gcs:        { name:'GROUND STATION',   color:'#39e0ff' },
+  radar:      { name:'RADAR PING',       color:'#ffd24d' },
+  iot:        { name:'IOT BURST',        color:'#b26bff' },
+  unknown:    { name:'UNKNOWN EMITTER',  color:'#ff9640' }
 };
 const CLAIM_COLOR = '#ffb454';
 
@@ -34,7 +39,11 @@ const EMITTERS = [
   { id:'EMT-007', cls:'controller', confidence:0.79, pos:[ 14,0,-22], vel:[ 0.35,0,-0.20] },
   { id:'EMT-013', cls:'enemy',      confidence:0.88, pos:[-30,0,-30], vel:[-1.60,0, 0.90] },
   { id:'EMT-021', cls:'walkie',     confidence:0.64, pos:[ 40,0, -8], vel:[ 0.10,0, 0.15] },
-  { id:'EMT-031', cls:'enemy',      confidence:0.81, pos:[-10,0, 26], vel:[ 0.60,0, 1.20] }
+  { id:'EMT-031', cls:'enemy',      confidence:0.81, pos:[-10,0, 26], vel:[ 0.60,0, 1.20] },
+  { id:'EMT-042', cls:'jammer',     confidence:0.92, pos:[ 26,0, 18], vel:[-0.40,0,-0.55] },
+  { id:'EMT-055', cls:'gcs',        confidence:0.71, pos:[-42,0,  6], vel:[ 0.25,0, 0.30] },
+  { id:'EMT-063', cls:'radar',      confidence:0.58, pos:[  4,0,-44], vel:[ 0.90,0, 0.40] },
+  { id:'EMT-078', cls:'iot',        confidence:0.45, pos:[-18,0,-10], vel:[ 0.15,0,-0.65] }
 ];
 
 const COMPASS = ['N','NE','E','SE','S','SW','W','NW'];
@@ -212,9 +221,23 @@ AFRAME.registerComponent('xr-launcher', {
       : { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking'] };
     navigator.xr.requestSession(mode, opts).then((session) => {
       self.setWorld(!isAR);
-      if (window.RFX) window.RFX.isAR = isAR;
+      if (window.RFX) {
+        window.RFX.isAR = isAR;
+        window.RFX.arEnterTime = performance.now();
+        window.RFX.helpUntil = performance.now() + 12000;   // auto-show controls on entry
+      }
       self.renderer.xr.setReferenceSpaceType('local-floor');
-      self.renderer.xr.setSession(session).then(() => document.body.classList.add('in-xr'));
+      self.renderer.xr.setSession(session).then(() => {
+        document.body.classList.add('in-xr');
+        // Fire anchor creation the moment we have a session, instead of
+        // waiting for anchor-lock's tick loop to notice it's missing.
+        // Needs one rendered frame before a reference space/pose exists.
+        if (isAR) {
+          const world = document.querySelector('#world');
+          const al = world && world.components['anchor-lock'];
+          if (al) requestAnimationFrame(() => requestAnimationFrame(() => al.bootstrap()));
+        }
+      });
       session.addEventListener('end', () => {
         document.body.classList.remove('in-xr');
         if (window.RFX) window.RFX.isAR = false;
@@ -251,6 +274,16 @@ AFRAME.registerComponent('anchor-lock', {
     this.anchorPos = new THREE.Vector3();
   },
   requestRecenter: function () { this.recenterFlag = true; },
+  bootstrap: function () {
+    // Called once, right after the AR session is set, so the first anchor
+    // starts resolving immediately instead of waiting for tick() to notice
+    // it's missing. Safe to call more than once — guarded by pending/anchor.
+    const scene = this.el.sceneEl, frame = scene.frame, r = scene.renderer;
+    if (!frame || !r || !r.xr || !frame.createAnchor) return;
+    const refSpace = r.xr.getReferenceSpace();
+    if (!refSpace || this.anchor || this.pending) return;
+    this._makeAnchor(frame, refSpace, new XRRigidTransform());
+  },
   _makeAnchor: function (frame, refSpace, xform) {
     const self = this, old = this.anchor;
     this.pending = true;
@@ -338,14 +371,24 @@ AFRAME.registerComponent('rf-emitter', {
     this.pulse.material.side = THREE.DoubleSide;
     this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
 
-    // solid core (raycast target)
+    // solid core (raycast target) — never occluded by anything
     this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.62,22,18),
-      new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false }));
+      new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false, depthTest:false }));
+    this.orb.renderOrder = 10;
     this.orb.position.y = 2.6; root.add(this.orb);
+
+    // white-hot inner core: reads as an energy source, not a plastic ball
+    this.hot = new THREE.Mesh(new THREE.SphereGeometry(0.30,16,12),
+      new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:0.9,
+        fog:false, toneMapped:false, depthTest:false, blending:THREE.AdditiveBlending }));
+    this.hot.renderOrder = 11;
+    this.hot.position.y = 2.6; root.add(this.hot);
 
     // fresnel rim shell — fake bloom, makes it emit light into the room
     this.rimMat = makeFresnelMaterial(this.baseColor);
+    this.rimMat.depthTest = false;
     this.rim = new THREE.Mesh(new THREE.SphereGeometry(0.95,24,18), this.rimMat);
+    this.rim.renderOrder = 9;
     this.rim.position.y = 2.6; root.add(this.rim);
 
     this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.25, 1),
@@ -405,7 +448,8 @@ AFRAME.registerComponent('rf-emitter', {
     this.pulse.scale.set(s,1,s);
     this.pulse.material.opacity = 0.6 * (1 - t);
     const bob = 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
-    this.orb.position.y = this.rim.position.y = this.shell.position.y = bob;
+    this.orb.position.y = this.rim.position.y = this.shell.position.y = this.hot.position.y = bob;
+    this.hot.material.opacity = 0.75 + 0.2*Math.sin(time*0.005 + this.phase);
     this.shell.rotation.y += step * (this.focused ? 1.1 : 0.35);
     this.shell.rotation.x += step * 0.15;
     if (this.claimed) {
@@ -575,8 +619,13 @@ AFRAME.registerComponent('status-hud', {
   tick: function (time) {
     const S = window.RFX;
     if (!S) return;
-    this.panel.mesh.visible = !!S.showStatus;
-    if (!S.showStatus) return;
+    const worldElChk = document.querySelector('#world');
+    const alChk = worldElChk && worldElChk.components['anchor-lock'];
+    const acquiring = S.isAR && alChk && !alChk.anchor;
+    // force the strip visible while acquiring, even if the user hid it,
+    // so the wait is legible instead of a silent black screen
+    this.panel.mesh.visible = !!S.showStatus || acquiring;
+    if (!this.panel.mesh.visible) return;
     if (time - this.last < 180) return;
     this.last = time;
     const cam = this.el.sceneEl.camera;
@@ -597,12 +646,15 @@ AFRAME.registerComponent('status-hud', {
       track  = al.lastPoseOK ? 'OK' : (al.anchor ? 'LOST' : '\u2014');
       n = al.anchorCount;
     }
-    this.draw(anchor, track, hx, hz, n, S.scale);
+    let waitMs = 0;
+    if (anchor === 'PENDING' && S.arEnterTime) waitMs = performance.now() - S.arEnterTime;
+    this.draw(anchor, track, hx, hz, n, S.scale, waitMs);
   },
-  draw: function (anchor, track, hx, hz, n, scale) {
+  draw: function (anchor, track, hx, hz, n, scale, waitMs) {
     const ctx=this.panel.ctx, cv=this.panel.cv, W=cv.width, H=cv.height;
     const good = anchor==='LOCKED' && track==='OK';
-    const col = good ? '#2dffa0' : (anchor==='PENDING' ? '#ffb454' : '#ff5252');
+    const pending = anchor==='PENDING';
+    const col = good ? '#2dffa0' : (pending ? '#ffb454' : '#ff5252');
     ctx.clearRect(0,0,W,H);
     ctx.fillStyle='rgba(2,10,7,0.90)';
     roundRect(ctx,3,3,W-6,H-6,12); ctx.fill();
@@ -610,11 +662,18 @@ AFRAME.registerComponent('status-hud', {
     ctx.textBaseline='middle';
     ctx.textAlign='left'; ctx.fillStyle=col;
     ctx.font='bold ' + Math.round(H*0.30) + 'px ui-monospace, monospace';
-    ctx.fillText('ANCHOR ' + anchor, W*0.03, H*0.32);
-    ctx.fillStyle = track==='OK' ? '#2dffa0' : '#ff5252';
-    ctx.font='bold ' + Math.round(H*0.24) + 'px ui-monospace, monospace';
-    ctx.textAlign='right';
-    ctx.fillText('TRK ' + track + '  x' + n, W*0.97, H*0.32);
+    const dots = pending ? '.'.repeat(1 + Math.floor(waitMs/400) % 3) : '';
+    ctx.fillText('ANCHOR ' + anchor + dots, W*0.03, H*0.32);
+    if (pending) {
+      ctx.fillStyle = '#ffb454'; ctx.textAlign='right';
+      ctx.font='bold ' + Math.round(H*0.24) + 'px ui-monospace, monospace';
+      ctx.fillText('ACQUIRING ' + (waitMs/1000).toFixed(1) + 's', W*0.97, H*0.32);
+    } else {
+      ctx.fillStyle = track==='OK' ? '#2dffa0' : '#ff5252';
+      ctx.font='bold ' + Math.round(H*0.24) + 'px ui-monospace, monospace';
+      ctx.textAlign='right';
+      ctx.fillText('TRK ' + track + '  x' + n, W*0.97, H*0.32);
+    }
     // the number that proves anchoring: head pos in anchored frame
     ctx.textAlign='left'; ctx.fillStyle='#eafff6';
     ctx.font='bold ' + Math.round(H*0.30) + 'px ui-monospace, monospace';
@@ -638,16 +697,22 @@ AFRAME.registerComponent('tactical-grid', {
 AFRAME.registerComponent('xr-input', {
   init: function () {
     const self = this;
-    // grip / B / Y -> recenter
-    ['gripdown','bbuttondown','ybuttondown'].forEach(function (evt) {
+    // grip -> recenter the field where you stand
+    ['gripdown'].forEach(function (evt) {
       self.el.addEventListener(evt, function () {
         const w = document.querySelector('#world');
         const c = w && w.components['anchor-lock'];
         if (c) c.requestRecenter();
       });
     });
-    // A / X -> toggle status strip
+    // A / X -> toggle help panel
     ['abuttondown','xbuttondown'].forEach(function (evt) {
+      self.el.addEventListener(evt, function () {
+        if (window.RFX) { window.RFX.showHelp = !window.RFX.showHelp; window.RFX.helpUntil = 0; }
+      });
+    });
+    // B / Y -> toggle status strip
+    ['bbuttondown','ybuttondown'].forEach(function (evt) {
       self.el.addEventListener(evt, function () {
         if (window.RFX) window.RFX.showStatus = !window.RFX.showStatus;
       });
@@ -658,9 +723,57 @@ AFRAME.registerComponent('xr-input', {
       if (!S || !e.detail) return;
       const y = e.detail.y;
       if (Math.abs(y) < 0.15) return;
-      const f = 1 - y * 0.035;      // push up = shrink, pull down = grow
+      const f = 1 - y * 0.035;
       S.scale = Math.min(CONFIG.scaleMax, Math.max(CONFIG.scaleMin, S.scale * f));
     });
+  }
+});
+
+/* ---------- help panel: auto-shows on entering XR, A/X toggles ---------- */
+AFRAME.registerComponent('help-panel', {
+  init: function () {
+    this.panel = makeCanvasPanel(0.46, 0.34, 2000);
+    this.panel.mesh.visible = false;
+    this.el.object3D.add(this.panel.mesh);
+    this.drawn = false;
+  },
+  tick: function () {
+    const S = window.RFX;
+    if (!S) return;
+    const auto = S.helpUntil && performance.now() < S.helpUntil;
+    const show = !!S.showHelp || !!auto;
+    this.panel.mesh.visible = show;
+    if (show && !this.drawn) { this.draw(); this.drawn = true; }
+  },
+  draw: function () {
+    const ctx = this.panel.ctx, cv = this.panel.cv, W = cv.width, H = cv.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = 'rgba(2,10,7,0.94)';
+    roundRect(ctx,4,4,W-8,H-8,18); ctx.fill();
+    ctx.strokeStyle = '#39e0ff'; ctx.lineWidth = 5; ctx.stroke();
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#39e0ff'; ctx.textAlign = 'center';
+    ctx.font = 'bold ' + Math.round(H*0.085) + 'px ui-monospace, monospace';
+    ctx.fillText('CONTROLS', W/2, H*0.10);
+    const rows = [
+      ['GAZE AT BEACON',  'target details'],
+      ['TRIGGER',         'claim / release target'],
+      ['HOLD GAZE 1.5s',  'claim without trigger'],
+      ['GRIP',            'recenter field here'],
+      ['STICK \u2191\u2193', 'world scale'],
+      ['A / X',           'this help'],
+      ['B / Y',           'anchor status']
+    ];
+    for (let i=0;i<rows.length;i++){
+      const y = H*(0.235 + i*0.115);
+      ctx.textAlign='left';  ctx.fillStyle='#eafff6';
+      ctx.font='bold ' + Math.round(H*0.062) + 'px ui-monospace, monospace';
+      ctx.fillText(rows[i][0], W*0.06, y);
+      ctx.textAlign='right'; ctx.fillStyle='#7fae9c';
+      ctx.font=Math.round(H*0.058) + 'px ui-monospace, monospace';
+      ctx.fillText(rows[i][1], W*0.94, y);
+    }
+    this.panel.tex.needsUpdate = true;
   }
 });
 
@@ -669,7 +782,8 @@ AFRAME.registerComponent('emitter-source', {
     const self = this;
     window.RFX = {
       playing:true, speed:1, beams:true, isAR:false, anchored:false,
-      gazed:null, claimProgress:0, scale:CONFIG.scale, showStatus:CONFIG.showStatus,
+      gazed:null, claimProgress:0, scale:CONFIG.scale, showStatus:CONFIG.showStatus, arEnterTime:0,
+      showHelp:false, helpUntil:0,
       home: EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
     };
     EMITTERS.forEach(function (e,i) {
@@ -704,8 +818,8 @@ AFRAME.registerComponent('emitter-source', {
 <div id="overlay">
   <h1>RF EMITTER HIGHLIGHTER</h1>
   <p>Standalone Meta Quest Browser &mdash; not over Link.<br>
-     <b>Gaze</b> a beacon for details &middot; <b>trigger</b> or hold gaze to CLAIM<br>
-     <b>Thumbstick up/down</b> scale world &middot; <b>grip/B/Y</b> recenter &middot; <b>A/X</b> hide status</p>
+     Controls are shown in-headset on entry (A/X re-opens them).<br>
+     8 emitter classes &middot; beacons show through real furniture.</p>
   <div class="btns">
     <button id="btn-ar" disabled>ENTER MIXED REALITY</button>
     <button id="btn-vr" disabled>ENTER VR</button>
@@ -735,8 +849,8 @@ AFRAME.registerComponent('emitter-source', {
         color="#2dffa0" material="shader:flat; fog:false"></a-ring>
       <!-- info box: low, tilted up toward the eye -->
       <a-entity id="gaze-hud" gaze-hud position="0 -0.30 -0.70" rotation="14 0 0"></a-entity>
-      <!-- status: below it, same tilt, unmissable -->
       <a-entity status-hud position="0 -0.45 -0.68" rotation="20 0 0"></a-entity>
+      <a-entity help-panel position="0.34 0.05 -0.75" rotation="0 -14 0"></a-entity>
     </a-camera>
     <a-entity laser-controls="hand:left"  xr-input></a-entity>
     <a-entity laser-controls="hand:right" xr-input></a-entity>
