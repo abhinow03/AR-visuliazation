@@ -363,6 +363,12 @@ AFRAME.registerComponent('rf-emitter', {
     const add = (o) => new THREE.MeshBasicMaterial({
       color:c3, transparent:true, opacity:o, fog:false, depthWrite:false,
       toneMapped:false, blending:THREE.AdditiveBlending });
+    const solid = (o) => new THREE.MeshBasicMaterial({
+      color:c3, transparent:o<1, opacity:o, fog:false, toneMapped:false });
+
+    // solid opaque spine inside the beam — survives any lighting, like system UI
+    this.spine = new THREE.Mesh(new THREE.CylinderGeometry(0.10,0.10,30,8), solid(0.95));
+    this.spine.position.y = 15; root.add(this.spine);
 
     // dark under-ring so the locator survives bright floors
     this.underRing = new THREE.Mesh(new THREE.RingGeometry(1.05,1.55,44),
@@ -371,7 +377,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.underRing.renderOrder = 7;
     this.underRing.rotation.x = -Math.PI/2; this.underRing.position.y = 0.02; root.add(this.underRing);
 
-    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.15,1.45,44), add(0.95));
+    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.15,1.45,44), solid(1.0));
     this.ring.material.side = THREE.DoubleSide;
     this.ring.material.depthTest = false; this.ring.renderOrder = 8;
     this.ring.rotation.x = -Math.PI/2; this.ring.position.y = 0.03; root.add(this.ring);
@@ -387,7 +393,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.back.position.y = 2.6; root.add(this.back);
 
     // solid core (raycast target) — depth-tested, so REAL furniture occludes it
-    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.62,22,18),
+    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.72,22,18),
       new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false }));
     this.orb.position.y = 2.6; root.add(this.orb);
 
@@ -399,7 +405,7 @@ AFRAME.registerComponent('rf-emitter', {
 
     // ghost silhouette: always-on-top, faint — reveals the beacon when occluded
     this.ghost = new THREE.Mesh(new THREE.SphereGeometry(0.62,16,12),
-      new THREE.MeshBasicMaterial({ color:c3, transparent:true, opacity:0.20,
+      new THREE.MeshBasicMaterial({ color:c3, transparent:true, opacity:0.30,
         fog:false, toneMapped:false, depthTest:false }));
     this.ghost.renderOrder = 12;
     this.ghost.position.y = 2.6; root.add(this.ghost);
@@ -411,7 +417,7 @@ AFRAME.registerComponent('rf-emitter', {
 
     this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.25, 1),
       new THREE.MeshBasicMaterial({ color:c3, wireframe:true, transparent:true,
-        opacity:0.30, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
+        opacity:0.55, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
     this.shell.position.y = 2.6; root.add(this.shell);
 
     this.claimRing = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.07, 8, 40),
@@ -429,7 +435,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.beamMat.uniforms.uActive.value = f ? 1.0 : 0.0;
     this.rimMat.uniforms.uActive.value = f ? 1.0 : 0.0;
     this.orb.scale.setScalar(f ? 1.25 : 1.0);
-    this.shell.material.opacity = f ? 0.7 : 0.30;
+    this.shell.material.opacity = f ? 0.95 : 0.55;
   },
   toggleClaim: function () {
     this.claimed = !this.claimed;
@@ -439,6 +445,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.rimMat.uniforms.uColor.value.copy(c);
     this.orb.material.color.copy(c);
     this.ghost.material.color.copy(c);
+    this.spine.material.color.copy(c);
     this.shell.material.color.copy(c);
     this.ring.material.color.copy(c);
     this.pulse.material.color.copy(c);
@@ -462,6 +469,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.beamMat.uniforms.uTime.value = ts;
     this.rimMat.uniforms.uTime.value = ts;
     this.beam.visible = S.beams;
+    this.spine.visible = S.beams;
     const t = ((time + this.phase) % 1800) / 1800;
     const s = 1 + t*4.0;
     this.pulse.scale.set(s,1,s);
