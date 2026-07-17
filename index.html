@@ -96,8 +96,8 @@ function makeBeamMaterial(colorHex) {
       '  bands = smoothstep(0.5, 1.0, bands) * 0.6;',
       '  float sweep = smoothstep(0.88, 1.0, sin((vUv.y * 3.0) - uTime * (2.0 + uActive * 5.0)));',
       '  float edge = sin(vUv.x * 3.14159);',
-      '  float a = (fade * (0.32 + bands + sweep * 0.8)) * edge;',
-      '  a *= uOpacity * (0.55 + uActive * 0.8);',
+      '  float a = (fade * (0.48 + bands + sweep * 0.8)) * edge;',
+      '  a *= uOpacity * (0.7 + uActive * 0.8);',
       '  gl_FragColor = vec4(uColor * (1.0 + uActive * 0.7), a);',
       '}'
     ].join('\n')
@@ -217,7 +217,7 @@ AFRAME.registerComponent('xr-launcher', {
     if (!navigator.xr || !this.renderer) return;
     const isAR = mode === 'immersive-ar';
     const opts = isAR
-      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','anchors'] }
+      ? { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking','anchors','plane-detection','mesh-detection'] }
       : { requiredFeatures:['local-floor'], optionalFeatures:['bounded-floor','hand-tracking'] };
     navigator.xr.requestSession(mode, opts).then((session) => {
       self.setWorld(!isAR);
@@ -364,31 +364,49 @@ AFRAME.registerComponent('rf-emitter', {
       color:c3, transparent:true, opacity:o, fog:false, depthWrite:false,
       toneMapped:false, blending:THREE.AdditiveBlending });
 
-    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.15,1.45,44), add(0.85));
+    // dark under-ring so the locator survives bright floors
+    this.underRing = new THREE.Mesh(new THREE.RingGeometry(1.05,1.55,44),
+      new THREE.MeshBasicMaterial({ color:0x02100a, transparent:true, opacity:0.5,
+        fog:false, toneMapped:false, depthTest:false, side:THREE.DoubleSide }));
+    this.underRing.renderOrder = 7;
+    this.underRing.rotation.x = -Math.PI/2; this.underRing.position.y = 0.02; root.add(this.underRing);
+
+    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.15,1.45,44), add(0.95));
     this.ring.material.side = THREE.DoubleSide;
+    this.ring.material.depthTest = false; this.ring.renderOrder = 8;
     this.ring.rotation.x = -Math.PI/2; this.ring.position.y = 0.03; root.add(this.ring);
-    this.pulse = new THREE.Mesh(new THREE.RingGeometry(0.8,1.0,44), add(0.6));
+    this.pulse = new THREE.Mesh(new THREE.RingGeometry(0.8,1.0,44), add(0.7));
     this.pulse.material.side = THREE.DoubleSide;
+    this.pulse.material.depthTest = false; this.pulse.renderOrder = 8;
     this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
 
-    // solid core (raycast target) — never occluded by anything
+    // dark contrast halo: gives the color something to pop against in bright rooms
+    this.back = new THREE.Mesh(new THREE.SphereGeometry(0.82,18,14),
+      new THREE.MeshBasicMaterial({ color:0x02100a, transparent:true, opacity:0.55,
+        fog:false, toneMapped:false }));
+    this.back.position.y = 2.6; root.add(this.back);
+
+    // solid core (raycast target) — depth-tested, so REAL furniture occludes it
     this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.62,22,18),
-      new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false, depthTest:false }));
-    this.orb.renderOrder = 10;
+      new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false }));
     this.orb.position.y = 2.6; root.add(this.orb);
 
-    // white-hot inner core: reads as an energy source, not a plastic ball
-    this.hot = new THREE.Mesh(new THREE.SphereGeometry(0.30,16,12),
-      new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:0.9,
-        fog:false, toneMapped:false, depthTest:false, blending:THREE.AdditiveBlending }));
-    this.hot.renderOrder = 11;
+    // white-hot inner core, full strength for bright rooms
+    this.hot = new THREE.Mesh(new THREE.SphereGeometry(0.34,16,12),
+      new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:1.0,
+        fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
     this.hot.position.y = 2.6; root.add(this.hot);
 
-    // fresnel rim shell — fake bloom, makes it emit light into the room
+    // ghost silhouette: always-on-top, faint — reveals the beacon when occluded
+    this.ghost = new THREE.Mesh(new THREE.SphereGeometry(0.62,16,12),
+      new THREE.MeshBasicMaterial({ color:c3, transparent:true, opacity:0.20,
+        fog:false, toneMapped:false, depthTest:false }));
+    this.ghost.renderOrder = 12;
+    this.ghost.position.y = 2.6; root.add(this.ghost);
+
+    // fresnel rim shell — depth-tested with the orb
     this.rimMat = makeFresnelMaterial(this.baseColor);
-    this.rimMat.depthTest = false;
     this.rim = new THREE.Mesh(new THREE.SphereGeometry(0.95,24,18), this.rimMat);
-    this.rim.renderOrder = 9;
     this.rim.position.y = 2.6; root.add(this.rim);
 
     this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.25, 1),
@@ -420,6 +438,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.beamMat.uniforms.uColor.value.copy(c);
     this.rimMat.uniforms.uColor.value.copy(c);
     this.orb.material.color.copy(c);
+    this.ghost.material.color.copy(c);
     this.shell.material.color.copy(c);
     this.ring.material.color.copy(c);
     this.pulse.material.color.copy(c);
@@ -448,14 +467,104 @@ AFRAME.registerComponent('rf-emitter', {
     this.pulse.scale.set(s,1,s);
     this.pulse.material.opacity = 0.6 * (1 - t);
     const bob = 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
-    this.orb.position.y = this.rim.position.y = this.shell.position.y = this.hot.position.y = bob;
-    this.hot.material.opacity = 0.75 + 0.2*Math.sin(time*0.005 + this.phase);
+    this.orb.position.y = this.rim.position.y = this.shell.position.y = bob;
+    this.hot.position.y = this.ghost.position.y = this.back.position.y = bob;
+    this.hot.material.opacity = 0.85 + 0.15*Math.sin(time*0.005 + this.phase);
     this.shell.rotation.y += step * (this.focused ? 1.1 : 0.35);
     this.shell.rotation.x += step * 0.15;
     if (this.claimed) {
       this.claimRing.rotation.z += step * 0.8;
       this.claimRing.material.opacity = 0.65 + Math.sin(time*0.004)*0.25;
     }
+  }
+});
+
+/* ============================================================
+   real-occluders — real furniture hides virtual content.
+   Reads the Scene Model (Space Setup on Quest Pro) via WebXR
+   plane-detection / mesh-detection and renders each surface as an
+   invisible depth-writing mesh: colorWrite off, depthWrite on.
+   Anything depth-tested behind a real desk gets cut; the ghost
+   silhouette + floor ring (depthTest:false) still show through.
+   Fails safe: no Scene Model -> no occluders -> previous behaviour.
+   ============================================================ */
+AFRAME.registerComponent('real-occluders', {
+  init: function () {
+    this.entries = new Map();   // XRMesh/XRPlane -> {mesh, changed}
+    this.group = new THREE.Group();
+    this.el.object3D.add(this.group);
+    this.occMat = new THREE.MeshBasicMaterial({ colorWrite:false });
+    this.occMat.depthWrite = true;
+  },
+  _planeGeometry: function (plane) {
+    // XRPlane polygon: points in plane-local space on the XZ plane
+    const pts = plane.polygon;
+    if (!pts || pts.length < 3) return null;
+    const verts = [], idx = [];
+    for (let i=0;i<pts.length;i++) verts.push(pts[i].x, pts[i].y, pts[i].z);
+    for (let i=1;i<pts.length-1;i++) idx.push(0, i, i+1);   // fan
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    g.setIndex(idx);
+    return g;
+  },
+  _meshGeometry: function (xrMesh) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(xrMesh.vertices, 3));
+    g.setIndex(new THREE.BufferAttribute(xrMesh.indices, 1));
+    return g;
+  },
+  tick: function () {
+    const S = window.RFX;
+    const scene = this.el.sceneEl, frame = scene.frame, r = scene.renderer;
+    this.group.visible = !!(S && S.isAR);
+    if (!this.group.visible || !frame || !r || !r.xr) return;
+    const ref = r.xr.getReferenceSpace();
+    if (!ref) return;
+    const seen = new Set();
+    const self = this;
+
+    function handle(item, space, buildGeom, changedTime) {
+      seen.add(item);
+      let e = self.entries.get(item);
+      if (!e || (changedTime !== undefined && e.changed !== changedTime)) {
+        const g = buildGeom(item);
+        if (!g) return;
+        if (e) { e.mesh.geometry.dispose(); e.mesh.geometry = g; e.changed = changedTime; }
+        else {
+          const m = new THREE.Mesh(g, self.occMat);
+          m.matrixAutoUpdate = false;
+          m.renderOrder = -10;
+          self.group.add(m);
+          e = { mesh:m, changed:changedTime };
+          self.entries.set(item, e);
+        }
+      }
+      const pose = frame.getPose(space, ref);
+      if (pose) {
+        e.mesh.visible = true;
+        e.mesh.matrix.fromArray(pose.transform.matrix);
+      } else e.mesh.visible = false;
+    }
+
+    if (frame.detectedPlanes) {
+      frame.detectedPlanes.forEach(function (pl) {
+        handle(pl, pl.planeSpace, self._planeGeometry.bind(self), pl.lastChangedTime);
+      });
+    }
+    if (frame.detectedMeshes) {
+      frame.detectedMeshes.forEach(function (xm) {
+        handle(xm, xm.meshSpace, self._meshGeometry.bind(self), xm.lastChangedTime);
+      });
+    }
+    // drop stale
+    this.entries.forEach(function (e, key) {
+      if (!seen.has(key)) {
+        self.group.remove(e.mesh); e.mesh.geometry.dispose();
+        self.entries.delete(key);
+      }
+    });
+    if (S) S.occluderCount = this.entries.size;
   }
 });
 
@@ -680,7 +789,8 @@ AFRAME.registerComponent('status-hud', {
     ctx.fillText('HEAD ' + hx + ' / ' + hz + ' m', W*0.03, H*0.72);
     ctx.textAlign='right'; ctx.fillStyle='#39e0ff';
     ctx.font='bold ' + Math.round(H*0.26) + 'px ui-monospace, monospace';
-    ctx.fillText('SCALE 1:' + Math.round(1/scale), W*0.97, H*0.72);
+    const occ = (window.RFX && window.RFX.occluderCount) ? window.RFX.occluderCount : 0;
+    ctx.fillText('OCC ' + occ + '  SCALE 1:' + Math.round(1/scale), W*0.97, H*0.72);
     this.panel.tex.needsUpdate = true;
   }
 });
@@ -831,7 +941,7 @@ AFRAME.registerComponent('emitter-source', {
   vr-mode-ui="enabled: false"
   webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking, anchors"
   renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
-  xr-launcher gaze-picker>
+  xr-launcher gaze-picker real-occluders>
 
   <a-entity light="type: ambient; color:#668877; intensity:0.9"></a-entity>
 
