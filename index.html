@@ -171,6 +171,83 @@ function makeScanMaterial() {
 }
 
 /* ============================================================
+   Semantic 3D models — solid skeleton styling, per class.
+   Colored mats collected in userData.mats for claim recolor.
+   ============================================================ */
+function buildEmitterModel(cls, color) {
+  const g = new THREE.Group(); const mats = [];
+  const M = (o) => { const m = new THREE.MeshBasicMaterial({ color:color.clone(),
+    fog:false, toneMapped:false, transparent:o<1, opacity:o }); mats.push(m); return m; };
+  const WHITE = () => new THREE.MeshBasicMaterial({ color:0xffffff, fog:false, toneMapped:false });
+
+  if (cls === 'enemy') {                       // low-poly drone
+    g.add(new THREE.Mesh(new THREE.BoxGeometry(0.5,0.16,0.5), M(1)));
+    const armG = new THREE.CylinderGeometry(0.035,0.035,0.9,6);
+    for (let i=0;i<2;i++){
+      const arm = new THREE.Mesh(armG, M(1));
+      arm.rotation.z = Math.PI/2; arm.rotation.y = (i===0?1:-1)*Math.PI/4;
+      g.add(arm);
+    }
+    const rotG = new THREE.TorusGeometry(0.22,0.028,6,14);
+    [[0.45,0.45],[0.45,-0.45],[-0.45,0.45],[-0.45,-0.45]].forEach(function(p){
+      const r = new THREE.Mesh(rotG, M(1));
+      r.rotation.x = Math.PI/2; r.position.set(p[0],0.10,p[1]);
+      g.add(r);
+      const hub = new THREE.Mesh(new THREE.SphereGeometry(0.05,6,5), WHITE());
+      hub.position.set(p[0],0.10,p[1]); g.add(hub);
+    });
+  } else if (cls === 'controller') {           // remote control
+    g.add(new THREE.Mesh(new THREE.BoxGeometry(0.5,0.14,0.75), M(1)));
+    const antG = new THREE.CylinderGeometry(0.025,0.025,0.55,6);
+    [-0.16,0.16].forEach(function(x,i){
+      const a = new THREE.Mesh(antG, M(1));
+      a.position.set(x,0.32,-0.28); a.rotation.x = -0.5; a.rotation.z = i===0?0.25:-0.25;
+      g.add(a);
+      const tip = new THREE.Mesh(new THREE.SphereGeometry(0.045,6,5), WHITE());
+      tip.position.set(x + (i===0?0.13:-0.13), 0.55, -0.53); g.add(tip);
+    });
+    [-0.13,0.13].forEach(function(x){
+      const stick = new THREE.Mesh(new THREE.SphereGeometry(0.06,8,6), WHITE());
+      stick.position.set(x,0.11,0.16); g.add(stick);
+    });
+  } else if (cls === 'walkie' || cls === 'gcs' || cls === 'iot') {   // antenna node
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.14,0.4), M(1));
+    base.position.y = -0.35; g.add(base);
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04,0.05,0.8,6), M(1));
+    pole.position.y = 0.05; g.add(pole);
+    const tip = new THREE.Mesh(new THREE.SphereGeometry(0.07,8,6), WHITE());
+    tip.position.y = 0.48; g.add(tip);
+    [0.22,0.38,0.54].forEach(function(r){
+      const arc = new THREE.Mesh(new THREE.TorusGeometry(r,0.022,6,14,Math.PI*0.55), M(0.95));
+      arc.position.y = 0.48; arc.rotation.z = Math.PI*0.225;
+      g.add(arc);
+    });
+  } else {                                     // default energy orb
+    g.add(new THREE.Mesh(new THREE.SphereGeometry(0.55,20,16), M(1)));
+    const eq = new THREE.Mesh(new THREE.TorusGeometry(0.72,0.03,6,24), M(0.95));
+    eq.rotation.x = Math.PI/2; g.add(eq);
+  }
+  g.userData.mats = mats;
+  return g;
+}
+
+/* wireframe clone of a model: shown ONLY while the real object is occluded */
+function makeWireframeClone(src, color) {
+  const g = new THREE.Group(); const mats = [];
+  src.traverse(function (o) {
+    if (o.isMesh) {
+      const m = new THREE.Mesh(o.geometry,
+        new THREE.MeshBasicMaterial({ color:color.clone(), wireframe:true, transparent:true,
+          opacity:0.6, depthTest:false, fog:false, toneMapped:false }));
+      m.position.copy(o.position); m.rotation.copy(o.rotation); m.scale.copy(o.scale);
+      m.renderOrder = 12; mats.push(m.material); g.add(m);
+    }
+  });
+  g.userData.mats = mats;
+  return g;
+}
+
+/* ============================================================
    XR session manager
    ============================================================ */
 AFRAME.registerComponent('xr-launcher', {
@@ -392,10 +469,16 @@ AFRAME.registerComponent('rf-emitter', {
         fog:false, toneMapped:false }));
     this.back.position.y = 2.6; root.add(this.back);
 
-    // solid core (raycast target) — depth-tested, so REAL furniture occludes it
-    this.orb = new THREE.Mesh(new THREE.SphereGeometry(0.72,22,18),
-      new THREE.MeshBasicMaterial({ color:c3, fog:false, toneMapped:false }));
-    this.orb.position.y = 2.6; root.add(this.orb);
+    // semantic model (solid skeleton) — depth-tested, real furniture occludes it
+    this.model = buildEmitterModel(e.cls, c3);
+    this.model.position.y = 2.6; this.model.scale.setScalar(1.4);
+    root.add(this.model);
+
+    // generous invisible gaze target — fixes tiny-hit-target gaze misses
+    this.hit = new THREE.Mesh(new THREE.SphereGeometry(1.7,10,8),
+      new THREE.MeshBasicMaterial({ visible:false }));
+    this.hit.position.y = 2.6; root.add(this.hit);
+    this.orb = this.hit;   // gaze-picker + HUD keep working via .orb
 
     // white-hot inner core, full strength for bright rooms
     this.hot = new THREE.Mesh(new THREE.SphereGeometry(0.34,16,12),
@@ -403,12 +486,14 @@ AFRAME.registerComponent('rf-emitter', {
         fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
     this.hot.position.y = 2.6; root.add(this.hot);
 
-    // ghost silhouette: always-on-top, faint — reveals the beacon when occluded
-    this.ghost = new THREE.Mesh(new THREE.SphereGeometry(0.62,16,12),
-      new THREE.MeshBasicMaterial({ color:c3, transparent:true, opacity:0.30,
-        fog:false, toneMapped:false, depthTest:false }));
-    this.ghost.renderOrder = 12;
-    this.ghost.position.y = 2.6; root.add(this.ghost);
+    // wireframe ghost of the SAME model — visible ONLY while occluded,
+    // so "sensed but out of line-of-sight" reads unambiguously
+    this.ghost = makeWireframeClone(this.model, c3);
+    this.ghost.position.y = 2.6; this.ghost.scale.setScalar(1.4);
+    this.ghost.visible = false;
+    root.add(this.ghost);
+    this._occT = 0; this._occRay = new THREE.Raycaster();
+    this._wp = new THREE.Vector3(); this._cp = new THREE.Vector3();
 
     // fresnel rim shell — depth-tested with the orb
     this.rimMat = makeFresnelMaterial(this.baseColor);
@@ -417,7 +502,7 @@ AFRAME.registerComponent('rf-emitter', {
 
     this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.25, 1),
       new THREE.MeshBasicMaterial({ color:c3, wireframe:true, transparent:true,
-        opacity:0.55, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
+        opacity:0.0, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
     this.shell.position.y = 2.6; root.add(this.shell);
 
     this.claimRing = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.07, 8, 40),
@@ -434,8 +519,8 @@ AFRAME.registerComponent('rf-emitter', {
     this.focused = f;
     this.beamMat.uniforms.uActive.value = f ? 1.0 : 0.0;
     this.rimMat.uniforms.uActive.value = f ? 1.0 : 0.0;
-    this.orb.scale.setScalar(f ? 1.25 : 1.0);
-    this.shell.material.opacity = f ? 0.95 : 0.55;
+    this.model.scale.setScalar(f ? 1.7 : 1.4);
+    this.shell.material.opacity = f ? 0.9 : 0.0;   // lock-on ring only when gazed
   },
   toggleClaim: function () {
     this.claimed = !this.claimed;
@@ -443,8 +528,8 @@ AFRAME.registerComponent('rf-emitter', {
     const c = new THREE.Color(this.claimed ? CLAIM_COLOR : this.baseColor);
     this.beamMat.uniforms.uColor.value.copy(c);
     this.rimMat.uniforms.uColor.value.copy(c);
-    this.orb.material.color.copy(c);
-    this.ghost.material.color.copy(c);
+    this.model.userData.mats.forEach(function(m){ m.color.copy(c); });
+    this.ghost.userData.mats.forEach(function(m){ m.color.copy(c); });
     this.spine.material.color.copy(c);
     this.shell.material.color.copy(c);
     this.ring.material.color.copy(c);
@@ -475,9 +560,30 @@ AFRAME.registerComponent('rf-emitter', {
     this.pulse.scale.set(s,1,s);
     this.pulse.material.opacity = 0.6 * (1 - t);
     const bob = 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
-    this.orb.position.y = this.rim.position.y = this.shell.position.y = bob;
+    this.model.position.y = this.hit.position.y = bob;
+    this.rim.position.y = this.shell.position.y = bob;
     this.hot.position.y = this.ghost.position.y = this.back.position.y = bob;
+    this.model.rotation.y += step * 0.4;
+    this.ghost.rotation.y = this.model.rotation.y;
     this.hot.material.opacity = 0.85 + 0.15*Math.sin(time*0.005 + this.phase);
+
+    // occlusion probe (4 Hz): ghost wireframe only while line-of-sight is blocked
+    if (time - this._occT > 250) {
+      this._occT = time;
+      let occluded = false;
+      const occ = this.el.sceneEl.components['real-occluders'];
+      const cam2 = this.el.sceneEl.camera;
+      if (occ && occ.entries.size && cam2) {
+        cam2.getWorldPosition(this._cp);
+        this.model.getWorldPosition(this._wp);
+        const dir = this._wp.clone().sub(this._cp);
+        const dist = dir.length();
+        this._occRay.set(this._cp, dir.normalize());
+        this._occRay.far = dist - 0.05;
+        occluded = this._occRay.intersectObjects(occ.group.children, false).length > 0;
+      }
+      this.ghost.visible = occluded;
+    }
     this.shell.rotation.y += step * (this.focused ? 1.1 : 0.35);
     this.shell.rotation.x += step * 0.15;
     if (this.claimed) {
@@ -840,8 +946,8 @@ AFRAME.registerComponent('xr-input', {
       const S = window.RFX;
       if (!S || !e.detail) return;
       const y = e.detail.y;
-      if (Math.abs(y) < 0.15) return;
-      const f = 1 - y * 0.035;
+      if (Math.abs(y) < 0.35) return;
+      const f = 1 - y * 0.022;
       S.scale = Math.min(CONFIG.scaleMax, Math.max(CONFIG.scaleMin, S.scale * f));
     });
   }
@@ -968,7 +1074,7 @@ AFRAME.registerComponent('emitter-source', {
       <!-- info box: low, tilted up toward the eye -->
       <a-entity id="gaze-hud" gaze-hud position="0 -0.30 -0.70" rotation="14 0 0"></a-entity>
       <a-entity status-hud position="0 -0.45 -0.68" rotation="20 0 0"></a-entity>
-      <a-entity help-panel position="0.34 0.05 -0.75" rotation="0 -14 0"></a-entity>
+      <a-entity help-panel position="0 0.02 -0.85"></a-entity>
     </a-camera>
     <a-entity laser-controls="hand:left"  xr-input></a-entity>
     <a-entity laser-controls="hand:right" xr-input></a-entity>
