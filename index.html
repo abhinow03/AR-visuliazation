@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#050807">
 <title>RF Emitter Highlighter XR</title>
 <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+<script src="formation_data.js"></script>
 <script>
 /* ============================================================
    RF Emitter Highlighter — tactical build v8
@@ -17,8 +18,9 @@
 const CONFIG = {
   bg:'#050807', fogDensity:0.010,
   gazeFar:250, dwellMs:280, claimDwellMs:1400,
-  scale: 0.18,          // starting world scale (1.0 = true metres)
-  scaleMin: 0.04, scaleMax: 1.0,
+  scale: 0.02,          // 1:50 default suits the swarm field data
+  scaleMin: 0.008, scaleMax: 1.0,
+  predictHorizon: 5.0,  // seconds ahead for path prediction
   showStatus: true      // A/X toggles in-headset
 };
 
@@ -45,6 +47,14 @@ const EMITTERS = [
   { id:'EMT-063', cls:'radar',      confidence:0.58, pos:[  4,0,-44], vel:[ 0.90,0, 0.40] },
   { id:'EMT-078', cls:'iot',        confidence:0.45, pos:[-18,0,-10], vel:[ 0.15,0,-0.65] }
 ];
+
+if (window.SWARM_DATA) {
+  EMITTERS.length = 0;
+  for (let i=1;i<=6;i++) EMITTERS.push({
+    id:'DRN-'+i, cls:'enemy', confidence:0.9,
+    pos:[0,100,0], vel:[0,0,0], driven:true
+  });
+}
 
 const COMPASS = ['N','NE','E','SE','S','SW','W','NW'];
 const bearing = (vx,vz) => { let d = Math.atan2(vx,-vz)*180/Math.PI; return d<0 ? d+360 : d; };
@@ -542,7 +552,10 @@ AFRAME.registerComponent('rf-emitter', {
     if (!S) return;
     const e = this.e, root = this.el.object3D;
     const step = Math.min(dt || 16, 50) / 1000;
-    if (S.playing) {
+    if (e.driven) {
+      // swarm-player writes e.pos/e.vel; root tracks ground point, model flies at altitude
+      root.position.set(e.pos[0], 0, e.pos[2]);
+    } else if (S.playing) {
       e.pos[0] += e.vel[0] * step * S.speed;
       e.pos[2] += e.vel[2] * step * S.speed;
       e.vel[0] += Math.sin(time*0.0005 + this.phase)*0.02*step;
@@ -559,10 +572,17 @@ AFRAME.registerComponent('rf-emitter', {
     const s = 1 + t*4.0;
     this.pulse.scale.set(s,1,s);
     this.pulse.material.opacity = 0.6 * (1 - t);
-    const bob = 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
+    const bob = e.driven
+      ? Math.max(2.0, e.pos[1])
+      : 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
     this.model.position.y = this.hit.position.y = bob;
     this.rim.position.y = this.shell.position.y = bob;
     this.hot.position.y = this.ghost.position.y = this.back.position.y = bob;
+    if (e.driven) {   // beam spans ground ring -> drone altitude
+      const k = bob / 30;
+      this.beam.scale.y = k;  this.beam.position.y = bob/2;
+      this.spine.scale.y = k; this.spine.position.y = bob/2;
+    }
     this.model.rotation.y += step * 0.4;
     this.ghost.rotation.y = this.model.rotation.y;
     this.hot.material.opacity = 0.85 + 0.15*Math.sin(time*0.005 + this.phase);
@@ -679,6 +699,139 @@ AFRAME.registerComponent('real-occluders', {
       }
     });
     if (S) S.occluderCount = this.entries.size;
+  }
+});
+
+/* ============================================================
+   swarm-player — streams the formation dataset through the same
+   per-emitter contract a live base station would use.
+   Also runs a REAL constant-velocity predictor over the stream:
+   the ghost marker is pos + vel*horizon computed live, and its
+   error vs what actually happens is measured and displayed.
+   ============================================================ */
+AFRAME.registerComponent('swarm-player', {
+  init: function () {
+    this.active = !!window.SWARM_DATA;
+    if (!this.active) return;
+    this.data = window.SWARM_DATA;
+    this.seqIdx = 0; this.t = 0;
+    this.comps = [];
+    this.pending = [];        // {due, pred:[x,y,z], drone}
+    this.errEma = null;
+    const self = this;
+    this.el.addEventListener('targets-ready', function () {
+      self.comps = Array.prototype.map.call(document.querySelectorAll('[rf-emitter]'),
+        function (el) { return el.components['rf-emitter']; });
+      self.initPredictionVisuals();
+    });
+  },
+
+  initPredictionVisuals: function () {
+    const world = document.querySelector('#world').object3D;
+    this.pred = this.comps.map(function (c) {
+      const color = new THREE.Color(c.baseColor);
+      const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+        color:color, transparent:true, opacity:0.85, depthTest:false, fog:false, toneMapped:false }));
+      line.renderOrder = 11; world.add(line);
+      const ghost = new THREE.Mesh(new THREE.SphereGeometry(0.9,10,8),
+        new THREE.MeshBasicMaterial({ color:color, wireframe:true, transparent:true,
+          opacity:0.7, depthTest:false, fog:false, toneMapped:false }));
+      ghost.renderOrder = 11; world.add(ghost);
+      return { line:line, ghost:ghost };
+    });
+  },
+
+  tick: function (time, dt) {
+    if (!this.active || !this.comps.length) return;
+    const S = window.RFX;
+    const seq = this.data.sequences[this.seqIdx];
+    const frames = seq.frames, fdt = this.data.dt;
+    if (S.playing) this.t += Math.min(dt||16,50)/1000 * S.speed;
+
+    const total = (frames.length-1) * fdt;
+    if (this.t >= total) {           // next sequence in the loop
+      this.t = 0;
+      this.seqIdx = (this.seqIdx+1) % this.data.sequences.length;
+      return;
+    }
+    const f = this.t / fdt;
+    const i = Math.floor(f), a = f - i;
+    const A = frames[i], B = frames[Math.min(i+1, frames.length-1)];
+
+    const horizon = CONFIG.predictHorizon;
+    const now = time/1000;
+    for (let d=0; d<6; d++) {
+      const c = this.comps[d]; if (!c) continue;
+      const e = c.e;
+      const px = A[d][0]+(B[d][0]-A[d][0])*a;
+      const py = A[d][1]+(B[d][1]-A[d][1])*a;
+      const pz = A[d][2]+(B[d][2]-A[d][2])*a;
+      // velocity from the sample pair (true m/s)
+      const vx = (B[d][0]-A[d][0])/fdt, vy=(B[d][1]-A[d][1])/fdt, vz=(B[d][2]-A[d][2])/fdt;
+      e.pos[0]=px; e.pos[1]=py; e.pos[2]=pz;
+      e.vel[0]=vx; e.vel[1]=vy; e.vel[2]=vz;
+
+      // live prediction + visuals
+      if (this.pred) {
+        const qx=px+vx*horizon, qy=py+vy*horizon, qz=pz+vz*horizon;
+        const P=this.pred[d];
+        P.line.geometry.setFromPoints([new THREE.Vector3(px,py,pz), new THREE.Vector3(qx,qy,qz)]);
+        P.ghost.position.set(qx,qy,qz);
+        // score a prediction once per second per drone
+        if (!P.nextScore || now >= P.nextScore) {
+          P.nextScore = now + 1.0;
+          this.pending.push({ due: now + horizon, pred:[qx,qy,qz], drone:d, seq:this.seqIdx });
+        }
+      }
+    }
+    // resolve matured predictions -> measured error
+    while (this.pending.length && this.pending[0].due <= now) {
+      const p = this.pending.shift();
+      if (p.seq !== this.seqIdx) continue;      // sequence rolled over; skip
+      const e = this.comps[p.drone].e;
+      const err = Math.hypot(e.pos[0]-p.pred[0], e.pos[1]-p.pred[1], e.pos[2]-p.pred[2]);
+      this.errEma = this.errEma===null ? err : this.errEma*0.8 + err*0.2;
+    }
+
+    // banner state
+    const prog = Math.round(this.t/total*100);
+    S.formation = seq.type==='static'
+      ? seq.from.toUpperCase().replace('_',' ') + ' — HOLDING'
+      : seq.from.toUpperCase().replace('_',' ') + ' → ' + seq.to.toUpperCase().replace('_',' ') + '  ' + prog + '%';
+    S.predErr = this.errEma;
+  }
+});
+
+/* ---------- formation banner: swarm intent + live prediction error ---------- */
+AFRAME.registerComponent('formation-banner', {
+  init: function () {
+    this.panel = makeCanvasPanel(0.52, 0.075, 2200);
+    this.panel.mesh.visible = false;
+    this.el.object3D.add(this.panel.mesh);
+    this.last = 0;
+  },
+  tick: function (time) {
+    const S = window.RFX;
+    const show = !!(S && S.formation);
+    this.panel.mesh.visible = show;
+    if (!show || time - this.last < 200) return;
+    this.last = time;
+    const ctx=this.panel.ctx, cv=this.panel.cv, W=cv.width, H=cv.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='rgba(2,10,7,0.92)';
+    roundRect(ctx,3,3,W-6,H-6,14); ctx.fill();
+    ctx.strokeStyle='#ff5252'; ctx.lineWidth=4; ctx.stroke();
+    ctx.textBaseline='middle';
+    ctx.fillStyle='#ff5252'; ctx.textAlign='left';
+    ctx.font='bold ' + Math.round(H*0.34) + 'px ui-monospace, monospace';
+    ctx.fillText('SWARM  ' + S.formation, W*0.03, H*0.5);
+    if (S.predErr !== null && S.predErr !== undefined) {
+      ctx.fillStyle='#39e0ff'; ctx.textAlign='right';
+      ctx.font='bold ' + Math.round(H*0.30) + 'px ui-monospace, monospace';
+      ctx.fillText('PRED ERR ' + S.predErr.toFixed(1) + 'm @' + CONFIG.predictHorizon + 's', W*0.97, H*0.5);
+    }
+    this.panel.tex.needsUpdate = true;
   }
 });
 
@@ -1007,7 +1160,7 @@ AFRAME.registerComponent('emitter-source', {
     window.RFX = {
       playing:true, speed:1, beams:true, isAR:false, anchored:false,
       gazed:null, claimProgress:0, scale:CONFIG.scale, showStatus:CONFIG.showStatus, arEnterTime:0,
-      showHelp:false, helpUntil:0,
+      showHelp:false, helpUntil:0, formation:null, predErr:null,
       home: EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
     };
     EMITTERS.forEach(function (e,i) {
@@ -1055,7 +1208,7 @@ AFRAME.registerComponent('emitter-source', {
   vr-mode-ui="enabled: false"
   webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking, anchors"
   renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
-  xr-launcher gaze-picker real-occluders>
+  xr-launcher gaze-picker real-occluders swarm-player>
 
   <a-entity light="type: ambient; color:#668877; intensity:0.9"></a-entity>
 
@@ -1075,6 +1228,7 @@ AFRAME.registerComponent('emitter-source', {
       <a-entity id="gaze-hud" gaze-hud position="0 -0.30 -0.70" rotation="14 0 0"></a-entity>
       <a-entity status-hud position="0 -0.45 -0.68" rotation="20 0 0"></a-entity>
       <a-entity help-panel position="0 0.02 -0.85"></a-entity>
+      <a-entity formation-banner position="0 0.24 -0.9"></a-entity>
     </a-camera>
     <a-entity laser-controls="hand:left"  xr-input></a-entity>
     <a-entity laser-controls="hand:right" xr-input></a-entity>
