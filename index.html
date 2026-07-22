@@ -21,10 +21,10 @@ const CONFIG = {
   bg:'#050807', fogDensity:0.010,
   gazeFar:250, dwellMs:280, claimDwellMs:1400, uiDwellMs:650,
   scale: 0.02, scaleMin: 0.008, scaleMax: 1.0,
-  predictHorizon: 5.0,
+  classifyEveryMs: 200,
   mode: 'swarm',
   showStatus: true,
-  showGhosts: true, showTrails: true
+  showOverlay: true, showTrails: true
 };
 
 const CLASSES = {
@@ -234,6 +234,88 @@ function buildEmitterModel(shape, color) {
   }
   g.userData.mats = mats;
   return g;
+}
+
+/* ============================================================
+   Formation classifier — geometric shape-matching, NOT a trained
+   model. Same contract a real transformer would fill: 6 positions
+   in, {label, confidences per class} out. Swap-in point for the
+   capstone's actual classifier; nothing downstream would change.
+   ============================================================ */
+const FORMATION_NAMES = ['column','converging','diamond','dispersed','encirclement','shield','v_shape'];
+
+function shapeDescriptor(points) {
+  // points: 6x [x,y,z] in a shared frame. Horizontal-plane (x,z) shape,
+  // recentered and scale-normalized so absolute position/size don't matter.
+  let cx=0, cz=0;
+  points.forEach(p=>{ cx+=p[0]; cz+=p[2]; });
+  cx/=points.length; cz/=points.length;
+  const pts = points.map(p=>[p[0]-cx, p[2]-cz]);
+
+  const radii = pts.map(p=>Math.hypot(p[0],p[1])).sort((a,b)=>a-b);
+  const meanR = (radii.reduce((a,b)=>a+b,0)/radii.length) || 1;
+  const radiiN = radii.map(r=>r/meanR);
+
+  const nn = pts.map((p,i)=>{
+    let m=Infinity;
+    pts.forEach((q,j)=>{ if(i!==j){ const d=Math.hypot(p[0]-q[0],p[1]-q[1]); if(d<m)m=d; } });
+    return m/meanR;
+  }).sort((a,b)=>a-b);
+
+  let sxx=0,szz=0,sxz=0;
+  pts.forEach(p=>{ sxx+=p[0]*p[0]; szz+=p[1]*p[1]; sxz+=p[0]*p[1]; });
+  sxx/=pts.length; szz/=pts.length; sxz/=pts.length;
+  const tr=sxx+szz, det=sxx*szz-sxz*sxz;
+  const disc=Math.sqrt(Math.max(0, tr*tr/4-det));
+  const l1=tr/2+disc, l2=Math.max(1e-6, tr/2-disc);
+  const aspect = Math.sqrt(l1/l2);
+
+  const hull = convexHull2D(pts);
+  const hullArea = Math.abs(polygonArea(hull)) / (meanR*meanR || 1);
+
+  return radiiN.concat(nn).concat([aspect, hullArea]);
+}
+
+function convexHull2D(pts) {
+  const p = pts.slice().sort((a,b)=> a[0]===b[0] ? a[1]-b[1] : a[0]-b[0]);
+  const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+  const lower=[]; for (const pt of p){ while(lower.length>=2 && cross(lower[lower.length-2],lower[lower.length-1],pt)<=0) lower.pop(); lower.push(pt); }
+  const upper=[]; for (let i=p.length-1;i>=0;i--){ const pt=p[i]; while(upper.length>=2 && cross(upper[upper.length-2],upper[upper.length-1],pt)<=0) upper.pop(); upper.push(pt); }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+function polygonArea(poly) {
+  let a=0;
+  for (let i=0;i<poly.length;i++){ const [x1,y1]=poly[i], [x2,y2]=poly[(i+1)%poly.length]; a += x1*y2 - x2*y1; }
+  return a/2;
+}
+
+/* z-score normalization across the 7 templates, computed once, reused for
+   every live frame so templates and live vectors are directly comparable. */
+function buildClassifier(templatesByName) {
+  const names = FORMATION_NAMES.filter(n => templatesByName[n]);
+  const raw = names.map(n => shapeDescriptor(templatesByName[n]));
+  const dims = raw[0].length;
+  const mean = new Array(dims).fill(0), std = new Array(dims).fill(0);
+  raw.forEach(v => v.forEach((x,i)=> mean[i]+=x));
+  mean.forEach((m,i)=> mean[i]=m/raw.length);
+  raw.forEach(v => v.forEach((x,i)=> std[i]+=(x-mean[i])*(x-mean[i])));
+  std.forEach((s,i)=> std[i]=Math.sqrt(s/raw.length) || 1);
+  const norm = v => v.map((x,i)=> (x-mean[i])/std[i]);
+  const templatesN = raw.map(norm);
+
+  return {
+    names: names,
+    classify: function (points) {
+      const v = norm(shapeDescriptor(points));
+      const dists = templatesN.map(t => Math.hypot(...t.map((x,i)=>x-v[i])));
+      const w = dists.map(d => Math.exp(-d));
+      const sum = w.reduce((a,b)=>a+b,0) || 1;
+      const conf = w.map(x=>x/sum);
+      let top=0; for (let i=1;i<conf.length;i++) if (conf[i]>conf[top]) top=i;
+      return { label: names[top], confidences: names.map((n,i)=>[n, conf[i]]) };
+    }
+  };
 }
 
 function makeWireframeClone(src, color) {
@@ -673,32 +755,26 @@ AFRAME.registerComponent('swarm-player', {
     this.data = window.SWARM_DATA;
     this.seqIdx = 0; this.t = 0;
     this.comps = [];
-    this.pending = [];
-    this.errEma = null;
+    this.classifier = this.data.templates ? buildClassifier(this.data.templates) : null;
+    this.lastClassify = 0;
     const self = this;
     this.el.addEventListener('targets-ready', function () {
       self.comps = Array.prototype.map.call(document.querySelectorAll('[rf-emitter]'),
         function (el) { return el.components['rf-emitter']; })
         .filter(function (c) { return c.e.mode === 'swarm'; });
-      self.initPredictionVisuals();
+      self.initOverlay();
     });
   },
-  initPredictionVisuals: function () {
+  initOverlay: function () {
     const world = document.querySelector('#world').object3D;
-    this.pred = this.comps.map(function (c) {
-      const color = new THREE.Color(c.baseColor);
-      const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
-      const mat = new THREE.LineDashedMaterial({
-        color:color, transparent:true, opacity:0.75, depthTest:false, fog:false,
-        toneMapped:false, dashSize:0.35, gapSize:0.22 });
-      const line = new THREE.Line(geo, mat);
-      line.renderOrder = 11; world.add(line);
-      const predMarker = new THREE.Mesh(new THREE.OctahedronGeometry(0.35,0),
-        new THREE.MeshBasicMaterial({ color:color, wireframe:true, transparent:true,
-          opacity:0.85, depthTest:false, fog:false, toneMapped:false }));
-      predMarker.renderOrder = 11; world.add(predMarker);
-      return { line:line, predMarker:predMarker };
-    });
+    const geo = new THREE.BufferGeometry().setFromPoints(new Array(7).fill(new THREE.Vector3()));
+    this.overlay = new THREE.LineLoop(geo, new THREE.LineBasicMaterial({
+      color:0x39e0ff, transparent:true, opacity:0.55, depthTest:false, fog:false, toneMapped:false }));
+    this.overlay.renderOrder = 11; world.add(this.overlay);
+    this.centroidDot = new THREE.Mesh(new THREE.SphereGeometry(0.18,8,6),
+      new THREE.MeshBasicMaterial({ color:0x39e0ff, transparent:true, opacity:0.7,
+        depthTest:false, fog:false, toneMapped:false }));
+    this.centroidDot.renderOrder = 11; world.add(this.centroidDot);
   },
   tick: function (time, dt) {
     if (!this.active || !this.comps.length) return;
@@ -716,9 +792,7 @@ AFRAME.registerComponent('swarm-player', {
     const f = this.t / fdt;
     const i = Math.floor(f), a = f - i;
     const A = frames[i], B = frames[Math.min(i+1, frames.length-1)];
-    const horizon = CONFIG.predictHorizon;
-    const now = time/1000;
-    const showGhosts = S.showGhosts && S.mode === 'swarm';
+    const livePts = [];
 
     for (let d=0; d<6; d++) {
       const c = this.comps[d]; if (!c) continue;
@@ -729,63 +803,109 @@ AFRAME.registerComponent('swarm-player', {
       const vx = (B[d][0]-A[d][0])/fdt, vy=(B[d][1]-A[d][1])/fdt, vz=(B[d][2]-A[d][2])/fdt;
       e.pos[0]=px; e.pos[1]=py; e.pos[2]=pz;
       e.vel[0]=vx; e.vel[1]=vy; e.vel[2]=vz;
+      livePts.push([px,py,pz]);
+    }
 
-      if (this.pred) {
-        const P = this.pred[d];
-        P.line.visible = showGhosts; P.predMarker.visible = showGhosts;
-        if (showGhosts) {
-          const qx=px+vx*horizon, qy=py+vy*horizon, qz=pz+vz*horizon;
-          P.line.geometry.setFromPoints([new THREE.Vector3(px,py,pz), new THREE.Vector3(qx,qy,qz)]);
-          P.line.computeLineDistances();
-          P.predMarker.position.set(qx,qy,qz);
-          if (!P.nextScore || now >= P.nextScore) {
-            P.nextScore = now + 1.0;
-            this.pending.push({ due: now + horizon, pred:[qx,qy,qz], drone:d, seq:this.seqIdx });
-          }
-        }
-      }
+    // live classification, throttled — this is where a real transformer
+    // would plug in: same input (6 positions), same output shape.
+    if (this.classifier && time - this.lastClassify > CONFIG.classifyEveryMs) {
+      this.lastClassify = time;
+      const result = this.classifier.classify(livePts);
+      S.classLabel = result.label;
+      S.classConf = result.confidences;
+      S.classTruth = seq.type === 'static' ? seq.from : null;   // mid-transition: no single "true" label
+      S.classMatch = S.classTruth ? (S.classLabel === S.classTruth) : null;
     }
-    while (this.pending.length && this.pending[0].due <= now) {
-      const p = this.pending.shift();
-      if (p.seq !== this.seqIdx) continue;
-      const e = this.comps[p.drone].e;
-      const err = Math.hypot(e.pos[0]-p.pred[0], e.pos[1]-p.pred[1], e.pos[2]-p.pred[2]);
-      this.errEma = this.errEma===null ? err : this.errEma*0.8 + err*0.2;
+
+    // shape overlay: the literal points the classifier is looking at
+    if (this.overlay && S.showOverlay && S.mode === 'swarm') {
+      this.overlay.visible = true; this.centroidDot.visible = true;
+      let cx=0,cy=0,cz=0;
+      livePts.forEach(p=>{ cx+=p[0]; cy+=p[1]; cz+=p[2]; });
+      cx/=6; cy/=6; cz/=6;
+      const ordered = livePts.slice().sort((p,q)=>
+        Math.atan2(p[2]-cz,p[0]-cx) - Math.atan2(q[2]-cz,q[0]-cx));
+      const loopPts = ordered.map(p=>new THREE.Vector3(p[0],p[1],p[2]));
+      loopPts.push(loopPts[0]);
+      this.overlay.geometry.setFromPoints(loopPts);
+      this.centroidDot.position.set(cx,cy,cz);
+    } else if (this.overlay) {
+      this.overlay.visible = false; this.centroidDot.visible = false;
     }
+
     const prog = Math.round(this.t/total*100);
     S.formation = seq.type==='static'
       ? seq.from.toUpperCase().replace('_',' ') + ' — HOLDING'
       : seq.from.toUpperCase().replace('_',' ') + ' → ' + seq.to.toUpperCase().replace('_',' ') + '  ' + prog + '%';
-    S.predErr = this.errEma;
   }
 });
 
+/* ---------- formation classifier readout: label + live confidence bars
+   across all 7 classes, plus ground-truth match when known (dataset
+   playback always knows it during static holds; a real deployment
+   would not, which is exactly why this stays visually distinct). ---------- */
 AFRAME.registerComponent('formation-banner', {
   init: function () {
-    this.panel = makeCanvasPanel(0.52, 0.075, 2200);
+    this.panel = makeCanvasPanel(0.56, 0.20, 2200);
     this.panel.mesh.visible = false;
     this.el.object3D.add(this.panel.mesh);
     this.last = 0;
   },
   tick: function (time) {
     const S = window.RFX;
-    const show = !!(S && S.formation && S.mode === 'swarm');
+    const show = !!(S && S.classLabel && S.mode === 'swarm');
     this.panel.mesh.visible = show;
-    if (!show || time - this.last < 200) return;
+    if (!show || time - this.last < 150) return;
     this.last = time;
+    this.draw(S);
+  },
+  draw: function (S) {
     const ctx=this.panel.ctx, cv=this.panel.cv, W=cv.width, H=cv.height;
     ctx.clearRect(0,0,W,H);
-    ctx.fillStyle='rgba(2,10,7,0.92)';
-    roundRect(ctx,3,3,W-6,H-6,14); ctx.fill();
-    ctx.strokeStyle='#ff5252'; ctx.lineWidth=4; ctx.stroke();
+    ctx.fillStyle='rgba(2,10,7,0.93)';
+    roundRect(ctx,3,3,W-6,H-6,16); ctx.fill();
+    ctx.strokeStyle='#39e0ff'; ctx.lineWidth=4; ctx.stroke();
     ctx.textBaseline='middle';
-    ctx.fillStyle='#ff5252'; ctx.textAlign='left';
-    ctx.font='bold ' + Math.round(H*0.34) + 'px ui-monospace, monospace';
-    ctx.fillText('SWARM  ' + S.formation, W*0.03, H*0.5);
-    if (S.predErr !== null && S.predErr !== undefined) {
-      ctx.fillStyle='#39e0ff'; ctx.textAlign='right';
-      ctx.font='bold ' + Math.round(H*0.30) + 'px ui-monospace, monospace';
-      ctx.fillText('PRED ERR ' + S.predErr.toFixed(1) + 'm @' + CONFIG.predictHorizon + 's', W*0.97, H*0.5);
+
+    const top = (S.classConf && S.classConf.find(c=>c[0]===S.classLabel)) || [S.classLabel,0];
+    ctx.fillStyle='#39e0ff'; ctx.textAlign='left';
+    ctx.font='bold ' + Math.round(H*0.155) + 'px ui-monospace, monospace';
+    ctx.fillText('CLASSIFIED  ' + S.classLabel.toUpperCase().replace('_',' '), W*0.035, H*0.13);
+    ctx.textAlign='right';
+    ctx.fillText(Math.round(top[1]*100) + '%', W*0.965, H*0.13);
+
+    if (S.classTruth) {
+      const match = S.classMatch;
+      ctx.textAlign='left'; ctx.fillStyle = match ? '#2dffa0' : '#ff5252';
+      ctx.font = Math.round(H*0.075) + 'px ui-monospace, monospace';
+      ctx.fillText('TRUTH ' + S.classTruth.toUpperCase().replace('_',' ') + '  ' + (match?'✓ MATCH':'✗ MISS'),
+        W*0.035, H*0.255);
+    } else {
+      ctx.textAlign='left'; ctx.fillStyle = '#7fae9c';
+      ctx.font = Math.round(H*0.075) + 'px ui-monospace, monospace';
+      ctx.fillText('mid-transition — no single true label', W*0.035, H*0.255);
+    }
+
+    // 7-class confidence bars, sorted by name for a stable layout
+    if (S.classConf) {
+      const rows = S.classConf.slice().sort((a,b)=> a[0]<b[0]?-1:1);
+      const top0 = rows.length;
+      const rowTop = H*0.36, rowH = (H*0.62)/top0;
+      rows.forEach((r,i) => {
+        const y = rowTop + i*rowH;
+        const isTop = r[0] === S.classLabel;
+        ctx.textAlign='left'; ctx.fillStyle = isTop ? '#eafff6' : '#7fae9c';
+        ctx.font = (isTop?'bold ':'') + Math.round(H*0.052) + 'px ui-monospace, monospace';
+        ctx.fillText(r[0].toUpperCase().replace('_',' '), W*0.035, y+rowH*0.5);
+        const bx = W*0.46, bw = W*0.44, bh = rowH*0.5;
+        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        roundRect(ctx, bx, y+rowH*0.25, bw, bh, bh/2); ctx.fill();
+        ctx.fillStyle = isTop ? '#39e0ff' : '#3a5b50';
+        roundRect(ctx, bx, y+rowH*0.25, Math.max(bh, bw*r[1]), bh, bh/2); ctx.fill();
+        ctx.textAlign='right'; ctx.fillStyle = isTop ? '#39e0ff' : '#7fae9c';
+        ctx.font = Math.round(H*0.045) + 'px ui-monospace, monospace';
+        ctx.fillText(Math.round(r[1]*100)+'%', W*0.965, y+rowH*0.5);
+      });
     }
     this.panel.tex.needsUpdate = true;
   }
@@ -972,36 +1092,39 @@ AFRAME.registerComponent('xr-input', {
 AFRAME.registerComponent('control-hub', {
   init: function () {
     const self = this;
-    this.panel = makeCanvasPanel(0.50, 0.66, 2000);
+    this.panel = makeCanvasPanel(0.60, 0.36, 2000);
     this.el.object3D.add(this.panel.mesh);
 
     this.ROWS = [
-      { key:'mode',     label:'MODE',      get:function(S){ return [S.mode==='swarm'?'SWARM':'BLOBS', '#39e0ff']; },
+      { key:'mode',     label:'MODE',      col:0, row:0, get:function(S){ return [S.mode==='swarm'?'SWARM':'BLOBS', '#39e0ff']; },
         run:function(S){ S.mode = S.mode==='swarm' ? 'blobs' : 'swarm'; } },
-      { key:'anchor',   label:'ANCHOR',    get:function(){ return ['TAP TO LOCK HERE', '#7fae9c']; },
+      { key:'anchor',   label:'ANCHOR',    col:0, row:1, get:function(){ return ['LOCK HERE', '#7fae9c']; },
         run:function(){ const w=document.querySelector('#world'); const c=w&&w.components['anchor-lock']; if(c) c.requestRecenter(); } },
-      { key:'resetview',label:'RESET VIEW',get:function(){ return ['ANCHOR + SCALE', '#7fae9c']; },
+      { key:'resetview',label:'RESET VIEW',col:0, row:2, get:function(){ return ['ANCHOR+SCALE', '#7fae9c']; },
         run:function(S){ S.scale = CONFIG.scale; const w=document.querySelector('#world'); const c=w&&w.components['anchor-lock']; if(c) c.requestRecenter(); } },
-      { key:'scaledn',  label:'SCALE \u2212', get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
+      { key:'scaledn',  label:'SCALE \u2212', col:0, row:3, get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
         run:function(S){ S.scale = clamp(S.scale*0.8, CONFIG.scaleMin, CONFIG.scaleMax); } },
-      { key:'scaleup',  label:'SCALE +',   get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
+      { key:'scaleup',  label:'SCALE +',   col:0, row:4, get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
         run:function(S){ S.scale = clamp(S.scale*1.25, CONFIG.scaleMin, CONFIG.scaleMax); } },
-      { key:'playback', label:'PLAYBACK',  get:function(S){ return [S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454']; },
+      { key:'playback', label:'PLAYBACK',  col:1, row:0, get:function(S){ return [S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454']; },
         run:function(S){ S.playing = !S.playing; } },
-      { key:'speed',    label:'SPEED',     get:function(S){ return [S.speed+'x', '#39e0ff']; },
+      { key:'speed',    label:'SPEED',     col:1, row:1, get:function(S){ return [S.speed+'x', '#39e0ff']; },
         run:function(S){ S.speed = S.speed>=4 ? 0.5 : S.speed*2; } },
-      { key:'ghosts',   label:'PRED GHOSTS', get:function(S){ return [S.showGhosts?'ON':'OFF', S.showGhosts?'#2dffa0':'#7fae9c']; },
-        run:function(S){ S.showGhosts = !S.showGhosts; } },
-      { key:'trails',   label:'TRAILS',    get:function(S){ return [S.showTrails?'ON':'OFF', S.showTrails?'#2dffa0':'#7fae9c']; },
+      { key:'overlay',  label:'SHAPE OVR', col:1, row:2, get:function(S){ return [S.showOverlay?'ON':'OFF', S.showOverlay?'#2dffa0':'#7fae9c']; },
+        run:function(S){ S.showOverlay = !S.showOverlay; } },
+      { key:'trails',   label:'TRAILS',    col:1, row:3, get:function(S){ return [S.showTrails?'ON':'OFF', S.showTrails?'#2dffa0':'#7fae9c']; },
         run:function(S){ S.showTrails = !S.showTrails; } },
-      { key:'debug',    label:'DEBUG INFO',get:function(S){ return [S.showStatus?'ON':'OFF', S.showStatus?'#2dffa0':'#7fae9c']; },
+      { key:'debug',    label:'DEBUG',     col:1, row:4, get:function(S){ return [S.showStatus?'ON':'OFF', S.showStatus?'#2dffa0':'#7fae9c']; },
         run:function(S){ S.showStatus = !S.showStatus; } }
     ];
 
-    this.rowMeshes = this.ROWS.map(function (row, i) {
-      const hp = new THREE.Mesh(new THREE.PlaneGeometry(0.46, 0.052),
+    // 2-column layout: halves the panel's vertical footprint (and therefore
+    // its angular size in-headset) versus a single 10-row column.
+    this.rowMeshes = this.ROWS.map(function (row) {
+      const x = row.col===0 ? -0.155 : 0.155;
+      const hp = new THREE.Mesh(new THREE.PlaneGeometry(0.29, 0.062),
         new THREE.MeshBasicMaterial({ visible:false }));
-      hp.position.set(0, self.rowY(i), 0.003);
+      hp.position.set(x, self.rowY(row.row), 0.003);
       self.panel.mesh.add(hp);
       return hp;
     });
@@ -1016,7 +1139,7 @@ AFRAME.registerComponent('control-hub', {
 
     this.render();
   },
-  rowY: function (i) { return 0.245 - i*0.0555; },
+  rowY: function (i) { return 0.115 - i*0.062; },
 
   instantActivate: function () {
     const cam = this.el.sceneEl.camera;
@@ -1073,6 +1196,7 @@ AFRAME.registerComponent('control-hub', {
   render: function (hoverIdx, hoverProg) {
     const S = window.RFX; if (!S) return;
     const ctx = this.panel.ctx, cv = this.panel.cv, W = cv.width, H = cv.height;
+    const PW = this.panel.w, PH = this.panel.h;   // metres, for fraction math matching hit-planes
     ctx.clearRect(0,0,W,H);
     ctx.fillStyle = 'rgba(2,10,7,0.94)';
     roundRect(ctx,4,4,W-8,H-8,20); ctx.fill();
@@ -1080,47 +1204,53 @@ AFRAME.registerComponent('control-hub', {
 
     ctx.textBaseline='middle'; ctx.textAlign='center';
     ctx.fillStyle = '#2dffa0';
-    ctx.font = 'bold ' + Math.round(H*0.042) + 'px ui-monospace, monospace';
-    ctx.fillText('CONTROL HUB', W/2, H*0.045);
+    ctx.font = 'bold ' + Math.round(H*0.062) + 'px ui-monospace, monospace';
+    ctx.fillText('CONTROL HUB', W/2, H*0.075);
     ctx.fillStyle = '#7fae9c';
-    ctx.font = Math.round(H*0.026) + 'px ui-monospace, monospace';
-    ctx.fillText('gaze + hold, or pull trigger', W/2, H*0.078);
+    ctx.font = Math.round(H*0.036) + 'px ui-monospace, monospace';
+    ctx.fillText('gaze + hold, or pull trigger', W/2, H*0.128);
 
-    const top = H*0.115, rowH = H*0.084;
+    // center divider between the two columns
+    ctx.strokeStyle = 'rgba(45,255,160,0.18)'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(W/2, H*0.16); ctx.lineTo(W/2, H*0.80); ctx.stroke();
+
+    const cellW = 0.29/PW * W, cellH = 0.062/PH * H;   // matches hit-plane size exactly
     for (let i=0;i<this.ROWS.length;i++){
       const row = this.ROWS[i];
-      const y = top + i*rowH;
+      const xm = row.col===0 ? -0.155 : 0.155;
+      const ym = 0.115 - row.row*0.062;
+      const cx = W*(0.5 + xm/PW), cy = H*(0.5 - ym/PH);
       const isHover = i === hoverIdx;
       const isFlash = i === this.flashRow;
 
       if (isFlash) {
         ctx.fillStyle = 'rgba(255,180,84,0.35)';
-        roundRect(ctx, W*0.04, y+rowH*0.06, W*0.92, rowH*0.82, 8); ctx.fill();
+        roundRect(ctx, cx-cellW/2, cy-cellH/2, cellW, cellH, 8); ctx.fill();
       } else if (isHover) {
         ctx.fillStyle = 'rgba(45,255,160,0.10)';
-        roundRect(ctx, W*0.04, y+rowH*0.06, W*0.92, rowH*0.82, 8); ctx.fill();
+        roundRect(ctx, cx-cellW/2, cy-cellH/2, cellW, cellH, 8); ctx.fill();
         if (hoverProg > 0.01) {
           ctx.fillStyle = 'rgba(45,255,160,0.32)';
-          roundRect(ctx, W*0.04, y+rowH*0.06, W*0.92*hoverProg, rowH*0.82, 8); ctx.fill();
+          roundRect(ctx, cx-cellW/2, cy-cellH/2, cellW*hoverProg, cellH, 8); ctx.fill();
         }
       }
       const val = row.get(S);
       ctx.textAlign='left'; ctx.fillStyle = isHover ? '#eafff6' : '#cfe6dc';
-      ctx.font = 'bold ' + Math.round(H*0.030) + 'px ui-monospace, monospace';
-      ctx.fillText(row.label, W*0.08, y+rowH*0.5);
-      ctx.textAlign='right'; ctx.fillStyle = val[1];
-      ctx.font = Math.round(H*0.028) + 'px ui-monospace, monospace';
-      ctx.fillText(val[0], W*0.93, y+rowH*0.5);
+      ctx.font = 'bold ' + Math.round(H*0.034) + 'px ui-monospace, monospace';
+      ctx.fillText(row.label, cx-cellW/2+6, cy-cellH*0.18);
+      ctx.fillStyle = val[1];
+      ctx.font = Math.round(H*0.032) + 'px ui-monospace, monospace';
+      ctx.fillText(val[0], cx-cellW/2+6, cy+cellH*0.26);
     }
 
-    const fy = top + this.ROWS.length*rowH + H*0.02;
+    const fy = H*0.86;
     ctx.strokeStyle = 'rgba(45,255,160,0.25)'; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.moveTo(W*0.06,fy-H*0.015); ctx.lineTo(W*0.94,fy-H*0.015); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W*0.06,fy-H*0.02); ctx.lineTo(W*0.94,fy-H*0.02); ctx.stroke();
     if (S.showStatus || this._forceStatus) {
       const st = this.readStatus();
       ctx.textAlign='left'; ctx.fillStyle = st.color;
-      ctx.font = 'bold ' + Math.round(H*0.026) + 'px ui-monospace, monospace';
-      ctx.fillText(st.line1, W*0.06, fy+H*0.025);
+      ctx.font = 'bold ' + Math.round(H*0.036) + 'px ui-monospace, monospace';
+      ctx.fillText(st.line1, W*0.06, fy+H*0.035);
       ctx.textAlign='left'; ctx.fillStyle = '#7fae9c';
       ctx.font = Math.round(H*0.024) + 'px ui-monospace, monospace';
       ctx.fillText(st.line2, W*0.06, fy+H*0.058);
@@ -1163,8 +1293,9 @@ AFRAME.registerComponent('emitter-source', {
     window.RFX = {
       playing:true, speed:1, beams:true, isAR:false, anchored:false,
       gazed:null, claimProgress:0, scale:CONFIG.scale, showStatus:CONFIG.showStatus, arEnterTime:0,
-      formation:null, predErr:null, mode:CONFIG.mode,
-      showGhosts:CONFIG.showGhosts, showTrails:CONFIG.showTrails,
+      formation:null, mode:CONFIG.mode,
+      classLabel:null, classConf:null, classTruth:null, classMatch:null,
+      showOverlay:CONFIG.showOverlay, showTrails:CONFIG.showTrails,
       home: ALL_EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
     };
     ALL_EMITTERS.forEach(function (e,i) {
@@ -1228,9 +1359,9 @@ AFRAME.registerComponent('emitter-source', {
       <a-ring id="reticle" position="0 -0.02 -1.2" radius-inner="0.005" radius-outer="0.009"
         color="#2dffa0" material="shader:flat; fog:false"></a-ring>
 
-      <a-entity formation-banner position="0 -0.06 -0.85"></a-entity>
-      <a-entity id="gaze-hud" gaze-hud position="0 -0.20 -0.70" rotation="10 0 0"></a-entity>
-      <a-entity control-hub position="0 -0.42 -0.62" rotation="18 0 0"></a-entity>
+      <a-entity formation-banner position="0 -0.02 -0.85"></a-entity>
+      <a-entity id="gaze-hud" gaze-hud position="0 -0.26 -0.70" rotation="12 0 0"></a-entity>
+      <a-entity control-hub position="0 -0.54 -0.60" rotation="16 0 0"></a-entity>
     </a-camera>
     <a-entity laser-controls="hand:left"  xr-input></a-entity>
     <a-entity laser-controls="hand:right" xr-input></a-entity>
