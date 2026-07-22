@@ -7,21 +7,28 @@
 <link rel="icon" href="data:,">
 <title>RF Emitter Highlighter XR</title>
 <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
-<script src="formation_data.js"></script>
 <script>
 /* ============================================================
-   RF Emitter Highlighter — tactical build v13
-   - dual demo modes (blobs / swarm) via a single control hub
-   - real clickable UI: gaze+dwell OR controller trigger, no
-     reliance on A-Frame's cursor internals — own raycast, tested
-   - all HUDs consolidated into one low, comfortable band
-   - per-drone colors, shape-based models, cleaner prediction viz
+   RF Emitter Highlighter — tactical build v14
+   - formations generated parametrically (ported 1:1 from the
+     capstone's get_formation_offsets/generate_transition_sequence),
+     no CSV/data file dependency anymore
+   - user-selectable formation with a live cosine-blend fly-to,
+     matching the real generator's S-curve and its explicit
+     TRANSITIONING state (the real model is 8-class: 7 formations
+     + transitioning, not 7-class-with-low-confidence)
+   - universal activation: gaze+dwell, controller trigger, OR
+     plain mouse/touch click — one interaction model everywhere
+   - flat DOM controls (mode + formation) work before ever
+     entering XR, so both demos are reachable on a plain browser
    ============================================================ */
 const CONFIG = {
   bg:'#050807', fogDensity:0.010,
   gazeFar:250, dwellMs:280, claimDwellMs:1400, uiDwellMs:650,
-  scale: 0.02, scaleMin: 0.008, scaleMax: 1.0,
+  scale: 0.05, scaleMin: 0.008, scaleMax: 1.0,
   classifyEveryMs: 200,
+  blendSeconds: 4.0,       // fly-to duration, matches the cosine S-curve
+  convergeShrinkSeconds: 8.0,
   mode: 'swarm',
   showStatus: true,
   showOverlay: true, showTrails: true
@@ -53,12 +60,10 @@ const BLOB_EMITTERS = [
 ];
 
 const SWARM_EMITTERS = [];
-if (window.SWARM_DATA) {
-  for (let i=1;i<=6;i++) SWARM_EMITTERS.push({
-    id:'DRN-'+i, cls:'swarm', confidence:0.9, colorOverride:SWARM_COLORS[i-1],
-    pos:[0,100,0], vel:[0,0,0], driven:true, mode:'swarm'
-  });
-}
+for (let i=1;i<=6;i++) SWARM_EMITTERS.push({
+  id:'DRN-'+i, cls:'swarm', confidence:0.9, colorOverride:SWARM_COLORS[i-1],
+  pos:[0,100,0], vel:[0,0,0], driven:true, mode:'swarm'
+});
 
 const ALL_EMITTERS = BLOB_EMITTERS.concat(SWARM_EMITTERS);
 
@@ -237,12 +242,63 @@ function buildEmitterModel(shape, color) {
 }
 
 /* ============================================================
-   Formation classifier — geometric shape-matching, NOT a trained
-   model. Same contract a real transformer would fill: 6 positions
-   in, {label, confidences per class} out. Swap-in point for the
-   capstone's actual classifier; nothing downstream would change.
+   Formation geometry — ported 1:1 from the capstone's Python
+   get_formation_offsets(). Same numbers, same units (metres),
+   same coordinate convention (x=right, y=forward -> mapped here
+   to scene x=east, z=-north; z=up -> scene y=up).
+   dispersed/converging are randomized scatter by design (matches
+   the Python: a fresh np.random.default_rng() draw per call).
    ============================================================ */
-const FORMATION_NAMES = ['column','converging','diamond','dispersed','encirclement','shield','v_shape'];
+const FORMATION_NAMES = ['v_shape','encirclement','column','diamond','dispersed','converging','shield'];
+
+function randomBoxScatter() {
+  // low=[-20,-20,-10], high=[20,20,10] on [right,forward,up] -> [x,z,y] here
+  const pts = [];
+  for (let i=0;i<6;i++) {
+    pts.push([
+      -20 + Math.random()*40,   // x (right)
+      -10 + Math.random()*20,   // y (up)
+      -20 + Math.random()*40    // z (forward, sign handled by caller)
+    ]);
+  }
+  return pts;
+}
+
+function getFormationOffsets(type, spread) {
+  spread = spread === undefined ? 1.0 : spread;
+  let off;   // array of 6x [x,y,z] in SCENE space (x=right, y=up, z=-forward)
+  if (type === 'v_shape') {
+    off = [[0,0,0],[-5,0,5],[5,0,5],[-10,0,10],[10,0,10],[0,0,8]];
+  } else if (type === 'encirclement') {
+    off = [];
+    for (let i=0;i<6;i++){ const a = (2*Math.PI*i)/6; off.push([10*Math.cos(a), 0, -10*Math.sin(a)]); }
+  } else if (type === 'column') {
+    off = [[0,0,0],[0,0,5],[0,0,10],[0,0,15],[0,0,20],[0,0,25]];
+  } else if (type === 'diamond') {
+    off = [[0,10,0],[0,0,-10],[-10,0,0],[10,0,0],[0,0,10],[0,-10,0]];
+  } else if (type === 'dispersed' || type === 'converging') {
+    off = randomBoxScatter().map(p=>[p[0], p[1], -p[2]]);
+  } else if (type === 'shield') {
+    off = [[-10,5,-10],[0,5,-10],[10,5,-10],[-10,-5,-10],[0,-5,-10],[10,-5,-10]];
+  } else {
+    throw new Error('unknown formation: ' + type);
+  }
+  return off.map(p => [p[0]*spread, p[1]*spread, p[2]*spread]);
+}
+
+/* exact cosine S-curve blend from the transition generator:
+   alpha=0 -> pure A, alpha=1 -> pure B, physically-plausible ease. */
+function cosineRamp(progress) {
+  progress = clamp(progress, 0, 1);
+  return (1 - Math.cos(Math.PI * progress)) / 2;
+}
+function blendOffsets(a, b, alpha) {
+  return a.map((p,i) => [
+    p[0]*(1-alpha) + b[i][0]*alpha,
+    p[1]*(1-alpha) + b[i][1]*alpha,
+    p[2]*(1-alpha) + b[i][2]*alpha
+  ]);
+}
 
 function shapeDescriptor(points) {
   // points: 6x [x,y,z] in a shared frame. Horizontal-plane (x,z) shape,
@@ -748,15 +804,36 @@ AFRAME.registerComponent('real-occluders', {
   }
 });
 
+/* ============================================================
+   swarm-player — generates formations parametrically (ported
+   from the capstone's Python) instead of replaying a CSV.
+   Selecting a formation captures wherever the swarm currently is
+   and blends to the target using the SAME cosine S-curve the
+   Python generator uses, over CONFIG.blendSeconds. While blending
+   the state is explicitly TRANSITIONING (matching the real 8-class
+   model: 7 formations + transitioning, not a forced top-1 guess).
+   Once settled, the geometric classifier runs continuously as an
+   independent check — same input/output contract a real trained
+   classifier would fill.
+   ============================================================ */
 AFRAME.registerComponent('swarm-player', {
   init: function () {
-    this.active = !!window.SWARM_DATA;
-    if (!this.active) return;
-    this.data = window.SWARM_DATA;
-    this.seqIdx = 0; this.t = 0;
     this.comps = [];
-    this.classifier = this.data.templates ? buildClassifier(this.data.templates) : null;
+    this.formation = 'v_shape';
+    this.pendingFormation = null;
+    this.offsetsB = getFormationOffsets('v_shape', 1.0);
+    this.offsetsA = this.offsetsB;
+    this.blending = false; this.blendT = 0; this.settledAt = 0;
+    this.prevPts = null;
     this.lastClassify = 0;
+
+    // classifier templates built from the EXACT ported geometry (no noise) —
+    // dispersed/converging get a fixed reference draw purely for template
+    // purposes; live dispersed/converging still redraws fresh each selection.
+    const templates = {};
+    FORMATION_NAMES.forEach(n => { templates[n] = getFormationOffsets(n, 1.0); });
+    this.classifier = buildClassifier(templates);
+
     const self = this;
     this.el.addEventListener('targets-ready', function () {
       self.comps = Array.prototype.map.call(document.querySelectorAll('[rf-emitter]'),
@@ -776,53 +853,83 @@ AFRAME.registerComponent('swarm-player', {
         depthTest:false, fog:false, toneMapped:false }));
     this.centroidDot.renderOrder = 11; world.add(this.centroidDot);
   },
+
+  // Called by the control-hub FORMATION row (or any external caller).
+  // Freezes wherever the swarm currently is as the blend start, so
+  // redirecting mid-maneuver behaves the way a real swarm would.
+  selectFormation: function (name) {
+    if (name === this.formation && !this.blending) return;
+    if (name === this.pendingFormation && this.blending) return;
+    this.offsetsA = this.currentOffsets || this.offsetsB;
+    this.offsetsB = getFormationOffsets(name, 1.0);
+    this.pendingFormation = name;
+    this.blending = true; this.blendT = 0;
+  },
+
   tick: function (time, dt) {
-    if (!this.active || !this.comps.length) return;
+    if (!this.comps.length) return;
     const S = window.RFX;
-    const seq = this.data.sequences[this.seqIdx];
-    const frames = seq.frames, fdt = this.data.dt;
-    if (S.playing) this.t += Math.min(dt||16,50)/1000 * S.speed;
+    const stepped = S.playing ? Math.min(dt||16,50)/1000 * S.speed : 0;
+    const now = time/1000;
+    let offsets, alpha = 1;
 
-    const total = (frames.length-1) * fdt;
-    if (this.t >= total) {
-      this.t = 0;
-      this.seqIdx = (this.seqIdx+1) % this.data.sequences.length;
-      return;
+    if (this.blending) {
+      this.blendT += stepped;
+      alpha = cosineRamp(this.blendT / CONFIG.blendSeconds);
+      offsets = blendOffsets(this.offsetsA, this.offsetsB, alpha);
+      if (this.blendT >= CONFIG.blendSeconds) {
+        this.blending = false;
+        this.formation = this.pendingFormation;
+        this.pendingFormation = null;
+        this.settledAt = now;
+      }
+    } else {
+      let scale = 1.0;
+      if (this.formation === 'converging') {
+        const elapsed = now - this.settledAt;
+        scale = 1.0 - 0.9 * clamp(elapsed / CONFIG.convergeShrinkSeconds, 0, 1);
+      }
+      offsets = this.offsetsB.map(p => [p[0]*scale, p[1]*scale, p[2]*scale]);
     }
-    const f = this.t / fdt;
-    const i = Math.floor(f), a = f - i;
-    const A = frames[i], B = frames[Math.min(i+1, frames.length-1)];
-    const livePts = [];
+    this.currentOffsets = offsets;
 
+    // fixed centroid with a gentle bob for life (the Python generator drifts
+    // the centroid indefinitely for finite training clips; a live indefinite
+    // demo instead holds position so the swarm never flies out of anchor range)
+    const cx = 0, cy = 100 + Math.sin(time*0.0004)*1.2, cz = 0;
+    const livePts = [];
     for (let d=0; d<6; d++) {
       const c = this.comps[d]; if (!c) continue;
       const e = c.e;
-      const px = A[d][0]+(B[d][0]-A[d][0])*a;
-      const py = A[d][1]+(B[d][1]-A[d][1])*a;
-      const pz = A[d][2]+(B[d][2]-A[d][2])*a;
-      const vx = (B[d][0]-A[d][0])/fdt, vy=(B[d][1]-A[d][1])/fdt, vz=(B[d][2]-A[d][2])/fdt;
+      const px = cx+offsets[d][0], py = cy+offsets[d][1], pz = cz+offsets[d][2];
+      if (this.prevPts && stepped>0) {
+        e.vel[0]=(px-this.prevPts[d][0])/stepped; e.vel[1]=(py-this.prevPts[d][1])/stepped; e.vel[2]=(pz-this.prevPts[d][2])/stepped;
+      }
       e.pos[0]=px; e.pos[1]=py; e.pos[2]=pz;
-      e.vel[0]=vx; e.vel[1]=vy; e.vel[2]=vz;
       livePts.push([px,py,pz]);
     }
+    this.prevPts = livePts;
 
-    // live classification, throttled — this is where a real transformer
-    // would plug in: same input (6 positions), same output shape.
-    if (this.classifier && time - this.lastClassify > CONFIG.classifyEveryMs) {
-      this.lastClassify = time;
-      const result = this.classifier.classify(livePts);
-      S.classLabel = result.label;
-      S.classConf = result.confidences;
-      S.classTruth = seq.type === 'static' ? seq.from : null;   // mid-transition: no single "true" label
-      S.classMatch = S.classTruth ? (S.classLabel === S.classTruth) : null;
+    // classification state — TRANSITIONING is ground truth (we control the
+    // blend), the geometric classifier only runs once settled, matching the
+    // real model's own from -> transitioning -> to design.
+    if (this.blending) {
+      S.transState = 'transitioning';
+      S.transFrom = this.formation; S.transTo = this.pendingFormation; S.transAlpha = alpha;
+      S.classLabel = null; S.classConf = null;
+    } else {
+      S.transState = 'settled';
+      S.selectedFormation = this.formation;
+      if (time - this.lastClassify > CONFIG.classifyEveryMs) {
+        this.lastClassify = time;
+        const result = this.classifier.classify(livePts);
+        S.classLabel = result.label;
+        S.classConf = result.confidences;
+      }
     }
 
-    // shape overlay: the literal points the classifier is looking at
     if (this.overlay && S.showOverlay && S.mode === 'swarm') {
       this.overlay.visible = true; this.centroidDot.visible = true;
-      let cx=0,cy=0,cz=0;
-      livePts.forEach(p=>{ cx+=p[0]; cy+=p[1]; cz+=p[2]; });
-      cx/=6; cy/=6; cz/=6;
       const ordered = livePts.slice().sort((p,q)=>
         Math.atan2(p[2]-cz,p[0]-cx) - Math.atan2(q[2]-cz,q[0]-cx));
       const loopPts = ordered.map(p=>new THREE.Vector3(p[0],p[1],p[2]));
@@ -832,18 +939,13 @@ AFRAME.registerComponent('swarm-player', {
     } else if (this.overlay) {
       this.overlay.visible = false; this.centroidDot.visible = false;
     }
-
-    const prog = Math.round(this.t/total*100);
-    S.formation = seq.type==='static'
-      ? seq.from.toUpperCase().replace('_',' ') + ' — HOLDING'
-      : seq.from.toUpperCase().replace('_',' ') + ' → ' + seq.to.toUpperCase().replace('_',' ') + '  ' + prog + '%';
   }
 });
 
-/* ---------- formation classifier readout: label + live confidence bars
-   across all 7 classes, plus ground-truth match when known (dataset
-   playback always knows it during static holds; a real deployment
-   would not, which is exactly why this stays visually distinct). ---------- */
+/* ---------- classifier readout: TRANSITIONING (A -> B, blend%) while
+   flying, CLASSIFIED + live confidence bars once settled. Leaner than
+   before — no separate truth/match row, since "truth" is now just the
+   user's own selection and restating it once matched adds nothing. ---------- */
 AFRAME.registerComponent('formation-banner', {
   init: function () {
     this.panel = makeCanvasPanel(0.56, 0.20, 2200);
@@ -853,9 +955,9 @@ AFRAME.registerComponent('formation-banner', {
   },
   tick: function (time) {
     const S = window.RFX;
-    const show = !!(S && S.classLabel && S.mode === 'swarm');
+    const show = !!(S && S.transState && S.mode === 'swarm');
     this.panel.mesh.visible = show;
-    if (!show || time - this.last < 150) return;
+    if (!show || time - this.last < 120) return;
     this.last = time;
     this.draw(S);
   },
@@ -864,33 +966,41 @@ AFRAME.registerComponent('formation-banner', {
     ctx.clearRect(0,0,W,H);
     ctx.fillStyle='rgba(2,10,7,0.93)';
     roundRect(ctx,3,3,W-6,H-6,16); ctx.fill();
+
+    if (S.transState === 'transitioning') {
+      ctx.strokeStyle='#ffb454'; ctx.lineWidth=4; ctx.stroke();
+      ctx.textBaseline='middle';
+      ctx.fillStyle='#ffb454'; ctx.textAlign='left';
+      ctx.font='bold ' + Math.round(H*0.16) + 'px ui-monospace, monospace';
+      ctx.fillText('TRANSITIONING', W*0.035, H*0.15);
+      ctx.textAlign='right';
+      ctx.fillText(Math.round(S.transAlpha*100) + '%', W*0.965, H*0.15);
+      ctx.fillStyle='#eafff6'; ctx.textAlign='left';
+      ctx.font = Math.round(H*0.09) + 'px ui-monospace, monospace';
+      ctx.fillText(S.transFrom.toUpperCase().replace('_',' ') + '  \u2192  ' + S.transTo.toUpperCase().replace('_',' '),
+        W*0.035, H*0.30);
+      const bx=W*0.035, bw=W*0.93, by=H*0.42, bh=H*0.09;
+      ctx.fillStyle='rgba(255,255,255,0.10)'; roundRect(ctx,bx,by,bw,bh,bh/2); ctx.fill();
+      ctx.fillStyle='#ffb454'; roundRect(ctx,bx,by,Math.max(bh,bw*S.transAlpha),bh,bh/2); ctx.fill();
+      ctx.textAlign='center'; ctx.fillStyle='#7fae9c';
+      ctx.font = Math.round(H*0.05) + 'px ui-monospace, monospace';
+      ctx.fillText('live cosine blend \u2014 not classifier output', W/2, H*0.62);
+      this.panel.tex.needsUpdate = true;
+      return;
+    }
+
     ctx.strokeStyle='#39e0ff'; ctx.lineWidth=4; ctx.stroke();
     ctx.textBaseline='middle';
-
-    const top = (S.classConf && S.classConf.find(c=>c[0]===S.classLabel)) || [S.classLabel,0];
+    const top = (S.classConf && S.classLabel && S.classConf.find(c=>c[0]===S.classLabel)) || [S.classLabel,0];
     ctx.fillStyle='#39e0ff'; ctx.textAlign='left';
     ctx.font='bold ' + Math.round(H*0.155) + 'px ui-monospace, monospace';
-    ctx.fillText('CLASSIFIED  ' + S.classLabel.toUpperCase().replace('_',' '), W*0.035, H*0.13);
+    ctx.fillText('CLASSIFIED  ' + (S.classLabel||'\u2014').toUpperCase().replace('_',' '), W*0.035, H*0.13);
     ctx.textAlign='right';
     ctx.fillText(Math.round(top[1]*100) + '%', W*0.965, H*0.13);
 
-    if (S.classTruth) {
-      const match = S.classMatch;
-      ctx.textAlign='left'; ctx.fillStyle = match ? '#2dffa0' : '#ff5252';
-      ctx.font = Math.round(H*0.075) + 'px ui-monospace, monospace';
-      ctx.fillText('TRUTH ' + S.classTruth.toUpperCase().replace('_',' ') + '  ' + (match?'✓ MATCH':'✗ MISS'),
-        W*0.035, H*0.255);
-    } else {
-      ctx.textAlign='left'; ctx.fillStyle = '#7fae9c';
-      ctx.font = Math.round(H*0.075) + 'px ui-monospace, monospace';
-      ctx.fillText('mid-transition — no single true label', W*0.035, H*0.255);
-    }
-
-    // 7-class confidence bars, sorted by name for a stable layout
     if (S.classConf) {
       const rows = S.classConf.slice().sort((a,b)=> a[0]<b[0]?-1:1);
-      const top0 = rows.length;
-      const rowTop = H*0.36, rowH = (H*0.62)/top0;
+      const rowTop = H*0.28, rowH = (H*0.68)/rows.length;
       rows.forEach((r,i) => {
         const y = rowTop + i*rowH;
         const isTop = r[0] === S.classLabel;
@@ -938,8 +1048,38 @@ AFRAME.registerComponent('gaze-picker', {
       self.byMode.swarm = self.compsByMode.swarm.map(function(c){ return c.orb; });
     });
     ['triggerdown'].forEach(function (evt) {
-      self.el.addEventListener(evt, function () { self.claim(); });
+      self.el.addEventListener(evt, function () { self.instantClaim(); });
     });
+    // any mouse/touch click on the canvas — desktop-friendly parity with
+    // the controller trigger. Guarded to the canvas so DOM overlay buttons
+    // (Enter AR, mode/formation controls) never double-fire this.
+    window.addEventListener('click', function (e) {
+      if (e.target && e.target.tagName === 'CANVAS') self.instantClaim();
+    });
+  },
+  // fresh raycast against whatever's under the reticle RIGHT NOW — click/
+  // trigger acts immediately, it doesn't wait for the dwell timer in tick()
+  // to have already picked something.
+  pickTarget: function () {
+    const cam = this.el.camera; const S = window.RFX;
+    if (!cam || !S) return null;
+    const orbs = this.byMode[S.mode], comps = this.compsByMode[S.mode];
+    if (!orbs || !orbs.length) return null;
+    cam.getWorldPosition(this.origin);
+    cam.getWorldDirection(this.dir);
+    this.ray.set(this.origin, this.dir);
+    const hits = this.ray.intersectObjects(orbs, false);
+    if (!hits.length) return null;
+    const obj = hits[0].object;
+    for (let i=0;i<comps.length;i++) if (comps[i].orb === obj) return comps[i];
+    return null;
+  },
+  instantClaim: function () {
+    const target = this.pickTarget();
+    if (!target) return;
+    if (this.current && this.current !== target) this.current.setFocused(false);
+    target.setFocused(true); this.current = target; this.claimArmed = 0;
+    this.claim();
   },
   claim: function () {
     if (!this.current) return;
@@ -1068,44 +1208,40 @@ AFRAME.registerComponent('tactical-grid', {
   }
 });
 
-AFRAME.registerComponent('xr-input', {
-  init: function () {
-    const self = this;
-    ['gripdown'].forEach(function (evt) {
-      self.el.addEventListener(evt, function () {
-        const w = document.querySelector('#world');
-        const c = w && w.components['anchor-lock'];
-        if (c) c.requestRecenter();
-      });
-    });
-    this.el.addEventListener('thumbstickmoved', function (e) {
-      const S = window.RFX;
-      if (!S || !e.detail) return;
-      const y = e.detail.y;
-      if (Math.abs(y) < 0.35) return;
-      const f = 1 - y * 0.022;
-      S.scale = clamp(S.scale * f, CONFIG.scaleMin, CONFIG.scaleMax);
-    });
-  }
-});
-
 AFRAME.registerComponent('control-hub', {
   init: function () {
     const self = this;
     this.panel = makeCanvasPanel(0.60, 0.36, 2000);
     this.el.object3D.add(this.panel.mesh);
 
+    const SCALE_PRESETS = [0.1, 0.05, 0.02, 0.008, 0.25];  // 1:10 .. 1:125, plus near-true 1:4
+
     this.ROWS = [
       { key:'mode',     label:'MODE',      col:0, row:0, get:function(S){ return [S.mode==='swarm'?'SWARM':'BLOBS', '#39e0ff']; },
         run:function(S){ S.mode = S.mode==='swarm' ? 'blobs' : 'swarm'; } },
-      { key:'anchor',   label:'ANCHOR',    col:0, row:1, get:function(){ return ['LOCK HERE', '#7fae9c']; },
+      { key:'formation',label:'FORMATION', col:0, row:1, get:function(S){
+          const sc = document.querySelector('a-scene'); const sp = sc && sc.components['swarm-player'];
+          const name = sp ? (sp.pendingFormation || sp.formation) : 'v_shape';
+          return [name.toUpperCase().replace('_',' '), S.transState==='transitioning'?'#ffb454':'#39e0ff'];
+        },
+        run:function(S){
+          const sc = document.querySelector('a-scene'); const sp = sc && sc.components['swarm-player'];
+          if (!sp) return;
+          const cur = sp.pendingFormation || sp.formation;
+          const idx = FORMATION_NAMES.indexOf(cur);
+          const next = FORMATION_NAMES[(idx+1) % FORMATION_NAMES.length];
+          sp.selectFormation(next);
+          if (S.mode !== 'swarm') S.mode = 'swarm';   // picking a formation implies you want to see it
+        } },
+      { key:'anchor',   label:'ANCHOR',    col:0, row:2, get:function(){ return ['LOCK HERE', '#7fae9c']; },
         run:function(){ const w=document.querySelector('#world'); const c=w&&w.components['anchor-lock']; if(c) c.requestRecenter(); } },
-      { key:'resetview',label:'RESET VIEW',col:0, row:2, get:function(){ return ['ANCHOR+SCALE', '#7fae9c']; },
+      { key:'scale',    label:'SCALE',     col:0, row:3, get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
+        run:function(S){
+          const i = SCALE_PRESETS.findIndex(v => Math.abs(v-S.scale) < 1e-6);
+          S.scale = SCALE_PRESETS[(i+1) % SCALE_PRESETS.length];
+        } },
+      { key:'resetview',label:'RESET VIEW',col:0, row:4, get:function(){ return ['ANCHOR+SCALE', '#7fae9c']; },
         run:function(S){ S.scale = CONFIG.scale; const w=document.querySelector('#world'); const c=w&&w.components['anchor-lock']; if(c) c.requestRecenter(); } },
-      { key:'scaledn',  label:'SCALE \u2212', col:0, row:3, get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
-        run:function(S){ S.scale = clamp(S.scale*0.8, CONFIG.scaleMin, CONFIG.scaleMax); } },
-      { key:'scaleup',  label:'SCALE +',   col:0, row:4, get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
-        run:function(S){ S.scale = clamp(S.scale*1.25, CONFIG.scaleMin, CONFIG.scaleMax); } },
       { key:'playback', label:'PLAYBACK',  col:1, row:0, get:function(S){ return [S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454']; },
         run:function(S){ S.playing = !S.playing; } },
       { key:'speed',    label:'SPEED',     col:1, row:1, get:function(S){ return [S.speed+'x', '#39e0ff']; },
@@ -1136,6 +1272,9 @@ AFRAME.registerComponent('control-hub', {
 
     const sceneEl = this.el.sceneEl;
     sceneEl.addEventListener('triggerdown', function () { self.instantActivate(); });
+    window.addEventListener('click', function (e) {
+      if (e.target && e.target.tagName === 'CANVAS') self.instantActivate();
+    });
 
     this.render();
   },
@@ -1293,8 +1432,10 @@ AFRAME.registerComponent('emitter-source', {
     window.RFX = {
       playing:true, speed:1, beams:true, isAR:false, anchored:false,
       gazed:null, claimProgress:0, scale:CONFIG.scale, showStatus:CONFIG.showStatus, arEnterTime:0,
-      formation:null, mode:CONFIG.mode,
-      classLabel:null, classConf:null, classTruth:null, classMatch:null,
+      mode:CONFIG.mode,
+      transState:null, transFrom:null, transTo:null, transAlpha:0,
+      selectedFormation:'v_shape',
+      classLabel:null, classConf:null,
       showOverlay:CONFIG.showOverlay, showTrails:CONFIG.showTrails,
       home: ALL_EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })
     };
@@ -1320,6 +1461,10 @@ AFRAME.registerComponent('emitter-source', {
     border-radius:7px;border:1px solid #2dffa0;background:rgba(45,255,160,.08);color:#2dffa0;cursor:pointer}
   .btns button:disabled{opacity:.35;border-color:#3a5b50;color:#5c7d70;cursor:not-allowed}
   .btns button.on{box-shadow:0 0 14px rgba(45,255,160,.35)}
+  #demoBtns{display:flex;gap:8px;margin-bottom:10px;border-top:1px solid rgba(45,255,160,.25);padding-top:10px}
+  #demoBtns button{flex:1;padding:9px 6px;font-family:inherit;font-size:11px;letter-spacing:.3px;
+    border-radius:7px;border:1px solid #39e0ff;background:rgba(57,224,255,.08);color:#39e0ff;cursor:pointer}
+  #demoBtns button:active{background:rgba(57,224,255,.25)}
   #diag{font-size:11px;line-height:1.6;border-top:1px solid rgba(45,255,160,.25);padding-top:9px}
   #diag.ok{color:#2dffa0} #diag.warn{color:#ffb454} #diag.bad{color:#ff5252}
   .in-xr #overlay{display:none}
@@ -1330,14 +1475,52 @@ AFRAME.registerComponent('emitter-source', {
 <div id="overlay">
   <h1>RF EMITTER HIGHLIGHTER</h1>
   <p>Standalone Meta Quest Browser &mdash; not over Link.<br>
-     One control hub, gaze+hold or trigger to use it.<br>
-     Two demos: BLOBS (static classes) and SWARM (live formation + prediction).</p>
+     One control hub, gaze+hold, trigger, or any click.<br>
+     Two demos: BLOBS (static classes) and SWARM (formation classifier).</p>
+  <div id="demoBtns">
+    <button id="btn-mode">MODE: SWARM</button>
+    <button id="btn-formation">FORMATION: V SHAPE</button>
+  </div>
   <div class="btns">
     <button id="btn-ar" disabled>ENTER MIXED REALITY</button>
     <button id="btn-vr" disabled>ENTER VR</button>
   </div>
   <div id="diag">checking XR support&hellip;</div>
 </div>
+
+<script>
+// Flat/desktop controls — work before ever entering XR, so both demos
+// and formation selection are reachable on a plain browser tab, not
+// only from the in-scene control hub. Same shared state either way.
+(function () {
+  function wire() {
+    if (!window.RFX) { setTimeout(wire, 200); return; }
+    const modeBtn = document.getElementById('btn-mode');
+    const formBtn = document.getElementById('btn-formation');
+    modeBtn.addEventListener('click', function () {
+      window.RFX.mode = window.RFX.mode === 'swarm' ? 'blobs' : 'swarm';
+    });
+    formBtn.addEventListener('click', function () {
+      const sc = document.querySelector('a-scene');
+      const sp = sc && sc.components['swarm-player'];
+      if (!sp || typeof FORMATION_NAMES === 'undefined') return;
+      const cur = sp.pendingFormation || sp.formation;
+      const idx = FORMATION_NAMES.indexOf(cur);
+      sp.selectFormation(FORMATION_NAMES[(idx+1) % FORMATION_NAMES.length]);
+      window.RFX.mode = 'swarm';
+    });
+    setInterval(function () {
+      const S = window.RFX;
+      modeBtn.textContent = 'MODE: ' + (S.mode==='swarm' ? 'SWARM' : 'BLOBS');
+      const sc = document.querySelector('a-scene');
+      const sp = sc && sc.components['swarm-player'];
+      const name = sp ? (sp.pendingFormation || sp.formation) : 'v_shape';
+      formBtn.textContent = 'FORMATION: ' + name.toUpperCase().replace('_',' ') + (S.transState==='transitioning' ? ' \u2026' : '');
+    }, 250);
+  }
+  wire();
+})();
+</script>
 
 <a-scene
   vr-mode-ui="enabled: false"
@@ -1363,8 +1546,8 @@ AFRAME.registerComponent('emitter-source', {
       <a-entity id="gaze-hud" gaze-hud position="0 -0.26 -0.70" rotation="12 0 0"></a-entity>
       <a-entity control-hub position="0 -0.54 -0.60" rotation="16 0 0"></a-entity>
     </a-camera>
-    <a-entity laser-controls="hand:left"  xr-input></a-entity>
-    <a-entity laser-controls="hand:right" xr-input></a-entity>
+    <a-entity laser-controls="hand:left"></a-entity>
+    <a-entity laser-controls="hand:right"></a-entity>
   </a-entity>
 </a-scene>
 </body>
