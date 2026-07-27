@@ -48,6 +48,9 @@ const CLASSES = {
   swarm:      { name:'SWARM DRONE',      color:'#ff5252', shape:'drone' }
 };
 const CLAIM_COLOR = '#ffb454';
+// Models render at world scale, so at 1:20 a 0.5m airframe is ~3cm on screen.
+// This multiplier keeps the drones readable as objects rather than specks.
+const MODEL_SCALE = 3.4;
 const SWARM_COLORS = ['#ff5252','#ffb454','#ffe14d','#2dffa0','#39e0ff','#b26bff'];
 
 const BLOB_EMITTERS = [
@@ -188,9 +191,19 @@ function makeScanMaterial() {
 
 function buildEmitterModel(shape, color) {
   const g = new THREE.Group(); const mats = [];
-  const M = (o) => { const m = new THREE.MeshBasicMaterial({ color:color.clone(),
-    fog:false, toneMapped:false, transparent:o<1, opacity:o }); mats.push(m); return m; };
-  const WHITE = () => new THREE.MeshBasicMaterial({ color:0xffffff, fog:false, toneMapped:false });
+  // Flat-shaded LIT material, not MeshBasic: with flatShading every facet
+  // catches the directional light differently, so the model reads as a solid
+  // 3D volume instead of a flat single-colour sticker. Strong emissive floor
+  // guarantees it never goes dark even facing away from the light — the look
+  // is opaque + saturated + facet-varied, which is what survives passthrough.
+  const M = (o) => {
+    const m = new THREE.MeshLambertMaterial({ color:color.clone(),
+      emissive:color.clone().multiplyScalar(0.55), flatShading:true,
+      fog:false, toneMapped:false, transparent:o<1, opacity:o });
+    mats.push(m); return m;
+  };
+  const WHITE = () => new THREE.MeshLambertMaterial({ color:0xffffff,
+    emissive:0x888888, flatShading:true, fog:false, toneMapped:false });
 
   if (shape === 'drone') {
     g.add(new THREE.Mesh(new THREE.BoxGeometry(0.5,0.16,0.5), M(1)));
@@ -444,6 +457,15 @@ AFRAME.registerComponent('xr-launcher', {
         window.RFX.arEnterTime = performance.now();
       }
       self.renderer.xr.setReferenceSpaceType('local-floor');
+      // Route the WebXR-native select event straight to the dashboard. This
+      // is far more reliable than depending on A-Frame's laser-controls
+      // emitting 'triggerdown' (which needs the right gamepad profile to be
+      // recognised), and it also makes hand-tracking pinch work for free.
+      session.addEventListener('selectstart', function () {
+        const hubEl = document.querySelector('#hub');
+        const hub = hubEl && hubEl.components['control-hub'];
+        if (hub) hub.onTrigger();
+      });
       self.renderer.xr.setSession(session).then(() => {
         document.body.classList.add('in-xr');
         if (isAR) {
@@ -590,7 +612,7 @@ AFRAME.registerComponent('rf-emitter', {
 
     const shape = CLASSES[e.cls].shape || 'orb';
     this.model = buildEmitterModel(shape, c3);
-    this.model.position.y = 2.6; this.model.scale.setScalar(1.4);
+    this.model.position.y = 2.6; this.model.scale.setScalar(MODEL_SCALE);
     root.add(this.model);
 
     this.hit = new THREE.Mesh(new THREE.SphereGeometry(1.7,10,8),
@@ -604,7 +626,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.hot.position.y = 2.6; root.add(this.hot);
 
     this.ghost = makeWireframeClone(this.model, c3);
-    this.ghost.position.y = 2.6; this.ghost.scale.setScalar(1.4);
+    this.ghost.position.y = 2.6; this.ghost.scale.setScalar(MODEL_SCALE);
     this.ghost.visible = false;
     root.add(this.ghost);
     this._occT = 0; this._occRay = new THREE.Raycaster();
@@ -640,7 +662,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.focused = f;
     this.beamMat.uniforms.uActive.value = f ? 1.0 : 0.0;
     this.rimMat.uniforms.uActive.value = f ? 1.0 : 0.0;
-    this.model.scale.setScalar(f ? 1.7 : 1.4);
+    this.model.scale.setScalar(f ? MODEL_SCALE*1.22 : MODEL_SCALE);
     this.shell.material.opacity = f ? 0.9 : 0.0;
   },
   toggleClaim: function () {
@@ -649,7 +671,10 @@ AFRAME.registerComponent('rf-emitter', {
     const c = new THREE.Color(this.claimed ? CLAIM_COLOR : this.baseColor);
     this.beamMat.uniforms.uColor.value.copy(c);
     this.rimMat.uniforms.uColor.value.copy(c);
-    this.model.userData.mats.forEach(function(m){ m.color.copy(c); });
+    this.model.userData.mats.forEach(function(m){
+      m.color.copy(c);
+      if (m.emissive) m.emissive.copy(c).multiplyScalar(0.55);
+    });
     this.ghost.userData.mats.forEach(function(m){ m.color.copy(c); });
     this.spine.material.color.copy(c);
     this.shell.material.color.copy(c);
@@ -1277,9 +1302,9 @@ AFRAME.registerComponent('control-hub', {
     const SCALE_PRESETS = [0.1, 0.05, 0.02, 0.008, 0.25];
 
     this.ROWS = [
-      { key:'mode',     label:'MODE',      col:0, row:0, get:function(S){ return [S.mode==='swarm'?'SWARM':'BLOBS', '#39e0ff']; },
+      { key:'mode',     label:'MODE',      col:0, row:0, desc:'Switch demo: SWARM formation flight vs BLOBS emitter classes', get:function(S){ return [S.mode==='swarm'?'SWARM':'BLOBS', '#39e0ff']; },
         run:function(S){ S.mode = S.mode==='swarm' ? 'blobs' : 'swarm'; } },
-      { key:'formation',label:'FORMATION', col:0, row:1, get:function(S){
+      { key:'formation',label:'FORMATION', col:0, row:1, desc:'Cycle the 7 formations. Swarm sweeps then morphs into the new shape', get:function(S){
           const sp = document.querySelector('a-scene').components['swarm-player'];
           const name = sp ? (sp.pendingFormation || sp.formation) : 'v_shape';
           return [name.toUpperCase().replace('_',' '), S.transState==='transitioning'?'#ffb454':'#39e0ff'];
@@ -1292,29 +1317,29 @@ AFRAME.registerComponent('control-hub', {
           sp.selectFormation(FORMATION_NAMES[(idx+1) % FORMATION_NAMES.length]);
           if (S.mode !== 'swarm') S.mode = 'swarm';
         } },
-      { key:'playback', label:'PLAYBACK',  col:0, row:2, get:function(S){ return [S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454']; },
+      { key:'playback', label:'PLAYBACK',  col:0, row:2, desc:'Freeze or resume all motion in the scene', get:function(S){ return [S.playing?'RUNNING':'PAUSED', S.playing?'#2dffa0':'#ffb454']; },
         run:function(S){ S.playing = !S.playing; } },
-      { key:'speed',    label:'SPEED',     col:0, row:3, get:function(S){ return [S.speed+'x', '#39e0ff']; },
+      { key:'speed',    label:'SPEED',     col:0, row:3, desc:'Time multiplier 0.5x - 4x, then wraps back to 0.5x', get:function(S){ return [S.speed+'x', '#39e0ff']; },
         run:function(S){ S.speed = S.speed>=4 ? 0.5 : S.speed*2; } },
-      { key:'scale',    label:'SCALE',     col:0, row:4, get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
+      { key:'scale',    label:'SCALE',     col:0, row:4, desc:'World size. 1:10 fills a hall, 1:125 fits a desk. Ranges stay true', get:function(S){ return ['1:' + Math.round(1/S.scale), '#39e0ff']; },
         run:function(S){
           const i = SCALE_PRESETS.findIndex(v => Math.abs(v-S.scale) < 1e-6);
           S.scale = SCALE_PRESETS[(i+1) % SCALE_PRESETS.length];
         } },
-      { key:'anchor',   label:'ANCHOR',    col:0, row:5, get:function(){ return ['LOCK HERE', '#7fae9c']; },
+      { key:'anchor',   label:'ANCHOR',    col:0, row:5, desc:'Re-pin the scene to where you stand now, facing your heading', get:function(){ return ['LOCK HERE', '#7fae9c']; },
         run:function(){ const w=document.querySelector('#world'); const c=w&&w.components['anchor-lock']; if(c) c.requestRecenter(); } },
 
-      { key:'overlay',  label:'SHAPE OVR', col:1, row:0, get:function(S){ return [S.showOverlay?'ON':'OFF', S.showOverlay?'#2dffa0':'#7fae9c']; },
+      { key:'overlay',  label:'SHAPE OVR', col:1, row:0, desc:'Cyan outline joining the 6 drones - the geometry the classifier reads', get:function(S){ return [S.showOverlay?'ON':'OFF', S.showOverlay?'#2dffa0':'#7fae9c']; },
         run:function(S){ S.showOverlay = !S.showOverlay; } },
-      { key:'trails',   label:'TRAILS',    col:1, row:1, get:function(S){ return [S.showTrails?'ON':'OFF', S.showTrails?'#2dffa0':'#7fae9c']; },
+      { key:'trails',   label:'TRAILS',    col:1, row:1, desc:'Smoothed motion history curve behind every tracked object', get:function(S){ return [S.showTrails?'ON':'OFF', S.showTrails?'#2dffa0':'#7fae9c']; },
         run:function(S){ S.showTrails = !S.showTrails; } },
-      { key:'debug',    label:'DEBUG',     col:1, row:2, get:function(S){ return [S.showStatus?'ON':'OFF', S.showStatus?'#2dffa0':'#7fae9c']; },
+      { key:'debug',    label:'DEBUG',     col:1, row:2, desc:'Anchor lock state, tracking health, occluder count, head position', get:function(S){ return [S.showStatus?'ON':'OFF', S.showStatus?'#2dffa0':'#7fae9c']; },
         run:function(S){ S.showStatus = !S.showStatus; } },
-      { key:'resetview',label:'RESET VIEW',col:1, row:3, get:function(){ return ['ANCHOR+SCALE', '#7fae9c']; },
+      { key:'resetview',label:'RESET VIEW',col:1, row:3, desc:'Restore default scale and re-anchor in one action', get:function(){ return ['ANCHOR+SCALE', '#7fae9c']; },
         run:function(S){ S.scale = CONFIG.scale; const w=document.querySelector('#world'); const c=w&&w.components['anchor-lock']; if(c) c.requestRecenter(); } },
-      { key:'exit',     label:'EXIT XR',   col:1, row:4, get:function(S){ return [S.isAR?'LEAVE MR':'LEAVE VR', '#ff9640']; },
+      { key:'exit',     label:'EXIT XR',   col:1, row:4, desc:'Leave the headset session and return to the flat page', get:function(S){ return [S.isAR?'LEAVE MR':'LEAVE VR', '#ff9640']; },
         run:function(){ const sc=document.querySelector('a-scene'); if (sc && sc.exitVR) sc.exitVR(); } },
-      { key:'close',    label:'CLOSE',     col:1, row:5, get:function(){ return ['DISMISS', '#ff5252']; },
+      { key:'close',    label:'CLOSE',     col:1, row:5, desc:'Dismiss this dashboard. Trigger anywhere off-panel does the same', get:function(){ return ['DISMISS', '#ff5252']; },
         run:function(){ /* handled by activate(): closes the hub */ } }
     ];
 
@@ -1396,6 +1421,11 @@ AFRAME.registerComponent('control-hub', {
   },
 
   onTrigger: function () {
+    // selectstart and A-Frame's triggerdown can both fire for one pull;
+    // collapse them into a single action.
+    const nowMs = performance.now();
+    if (this._lastTrigger && nowMs - this._lastTrigger < 250) return;
+    this._lastTrigger = nowMs;
     if (this.open) {
       const idx = this.pickRow();
       if (idx >= 0) { this.activate(idx); return; }
@@ -1494,7 +1524,23 @@ AFRAME.registerComponent('control-hub', {
     const fy = H*0.90;
     ctx.strokeStyle = 'rgba(45,255,160,0.25)'; ctx.lineWidth=2;
     ctx.beginPath(); ctx.moveTo(W*0.06,fy-H*0.025); ctx.lineTo(W*0.94,fy-H*0.025); ctx.stroke();
-    if (S.showStatus || this._forceStatus) {
+    // hovering a row explains that row; otherwise fall back to status/debug
+    if (hoverIdx >= 0 && this.ROWS[hoverIdx].desc) {
+      ctx.textAlign='left'; ctx.fillStyle='#39e0ff';
+      ctx.font = 'bold ' + Math.round(H*0.030) + 'px ui-monospace, monospace';
+      ctx.fillText(this.ROWS[hoverIdx].label, W*0.06, fy+H*0.020);
+      ctx.fillStyle='#cfe6dc';
+      ctx.font = Math.round(H*0.026) + 'px ui-monospace, monospace';
+      const words = this.ROWS[hoverIdx].desc.split(' ');
+      const maxW = W*0.88; let line='', y=fy+H*0.055;
+      for (let w=0; w<words.length; w++) {
+        const test = line ? line+' '+words[w] : words[w];
+        if (ctx.measureText(test).width > maxW && line) {
+          ctx.fillText(line, W*0.06, y); line = words[w]; y += H*0.032;
+        } else line = test;
+      }
+      if (line) ctx.fillText(line, W*0.06, y);
+    } else if (S.showStatus || this._forceStatus) {
       const st = this.readStatus();
       ctx.textAlign='left'; ctx.fillStyle = st.color;
       ctx.font = 'bold ' + Math.round(H*0.030) + 'px ui-monospace, monospace';
@@ -1637,7 +1683,11 @@ AFRAME.registerComponent('emitter-source', {
   renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
   xr-launcher gaze-picker real-occluders swarm-player>
 
-  <a-entity light="type: ambient; color:#668877; intensity:0.9"></a-entity>
+  <a-entity light="type: ambient; color:#8899aa; intensity:0.75"></a-entity>
+  <!-- key light: gives flat-shaded facets distinct values so low-poly models
+       read as solid volumes (the trick behind bright low-poly MR demos) -->
+  <a-entity light="type: directional; color:#ffffff; intensity:1.5" position="3 6 2"></a-entity>
+  <a-entity light="type: directional; color:#88aaff; intensity:0.5" position="-4 -1 -3"></a-entity>
 
   <a-plane id="ground" rotation="-90 0 0" width="300" height="300" color="#07110d" material="shader:flat"></a-plane>
   <a-entity id="grid" tactical-grid></a-entity>
