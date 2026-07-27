@@ -25,6 +25,7 @@
 const CONFIG = {
   bg:'#050807', fogDensity:0.010,
   gazeFar:250, dwellMs:280, claimDwellMs:1400, uiDwellMs:650,
+  cursorSpeed: 0.75,       // metres/sec of panel travel at full stick deflection
   scale: 0.05, scaleMin: 0.008, scaleMax: 1.0,
   classifyEveryMs: 200,
   blendSeconds: 4.0,       // fly-to duration, matches the cosine S-curve
@@ -103,7 +104,7 @@ function roundRect(ctx,x,y,w,h,r){
 
 function makeBeamMaterial(colorHex) {
   return new THREE.ShaderMaterial({
-    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, side:THREE.DoubleSide,
+    transparent:true, depthWrite:false, blending:THREE.NormalBlending, side:THREE.DoubleSide,
     uniforms: {
       uColor:{ value:new THREE.Color(colorHex) }, uTime:{ value:0 },
       uActive:{ value:0.0 }, uOpacity:{ value:0.9 }
@@ -577,38 +578,38 @@ AFRAME.registerComponent('rf-emitter', {
     const root = this.el.object3D;
     const c3 = new THREE.Color(this.baseColor);
 
+    // All beacon geometry uses NORMAL blending, never additive: additive adds
+    // to the passthrough behind it, so it washes out toward white against a
+    // bright wall. Normal blending composites properly and holds its colour.
     this.beamMat = makeBeamMaterial(this.baseColor);
     this.beam = new THREE.Mesh(new THREE.CylinderGeometry(0.34,0.34,30,12,1,true), this.beamMat);
     this.beam.position.y = 15; root.add(this.beam);
 
-    const add = (o) => new THREE.MeshBasicMaterial({
+    const soft = (o) => new THREE.MeshBasicMaterial({
       color:c3, transparent:true, opacity:o, fog:false, depthWrite:false,
-      toneMapped:false, blending:THREE.AdditiveBlending });
-    const solid = (o) => new THREE.MeshBasicMaterial({
-      color:c3, transparent:o<1, opacity:o, fog:false, toneMapped:false });
+      toneMapped:false, blending:THREE.NormalBlending });
+    const solid = () => new THREE.MeshBasicMaterial({
+      color:c3, transparent:false, opacity:1, fog:false, toneMapped:false });
 
-    this.spine = new THREE.Mesh(new THREE.CylinderGeometry(0.10,0.10,30,8), solid(0.95));
+    this.spine = new THREE.Mesh(new THREE.CylinderGeometry(0.10,0.10,30,8), solid());
     this.spine.position.y = 15; root.add(this.spine);
 
-    this.underRing = new THREE.Mesh(new THREE.RingGeometry(1.05,1.55,44),
-      new THREE.MeshBasicMaterial({ color:0x02100a, transparent:true, opacity:0.5,
+    // dark opaque outline ring under the bright ring: pure contrast device,
+    // gives the locator a hard edge on light-coloured floors
+    this.underRing = new THREE.Mesh(new THREE.RingGeometry(1.55,2.35,48),
+      new THREE.MeshBasicMaterial({ color:0x02100a, transparent:false,
         fog:false, toneMapped:false, depthTest:false, side:THREE.DoubleSide }));
     this.underRing.renderOrder = 7;
     this.underRing.rotation.x = -Math.PI/2; this.underRing.position.y = 0.02; root.add(this.underRing);
 
-    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.15,1.45,44), solid(1.0));
+    this.ring = new THREE.Mesh(new THREE.RingGeometry(1.7,2.2,48), solid());
     this.ring.material.side = THREE.DoubleSide;
     this.ring.material.depthTest = false; this.ring.renderOrder = 8;
     this.ring.rotation.x = -Math.PI/2; this.ring.position.y = 0.03; root.add(this.ring);
-    this.pulse = new THREE.Mesh(new THREE.RingGeometry(0.8,1.0,44), add(0.7));
+    this.pulse = new THREE.Mesh(new THREE.RingGeometry(1.2,1.5,48), soft(0.85));
     this.pulse.material.side = THREE.DoubleSide;
     this.pulse.material.depthTest = false; this.pulse.renderOrder = 8;
     this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
-
-    this.back = new THREE.Mesh(new THREE.SphereGeometry(0.82,18,14),
-      new THREE.MeshBasicMaterial({ color:0x02100a, transparent:true, opacity:0.55,
-        fog:false, toneMapped:false }));
-    this.back.position.y = 2.6; root.add(this.back);
 
     const shape = CLASSES[e.cls].shape || 'orb';
     this.model = buildEmitterModel(shape, c3);
@@ -620,10 +621,6 @@ AFRAME.registerComponent('rf-emitter', {
     this.hit.position.y = 2.6; root.add(this.hit);
     this.orb = this.hit;
 
-    this.hot = new THREE.Mesh(new THREE.SphereGeometry(0.34,16,12),
-      new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:1.0,
-        fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
-    this.hot.position.y = 2.6; root.add(this.hot);
 
     this.ghost = makeWireframeClone(this.model, c3);
     this.ghost.position.y = 2.6; this.ghost.scale.setScalar(MODEL_SCALE);
@@ -632,18 +629,16 @@ AFRAME.registerComponent('rf-emitter', {
     this._occT = 0; this._occRay = new THREE.Raycaster();
     this._wp = new THREE.Vector3(); this._cp = new THREE.Vector3();
 
-    this.rimMat = makeFresnelMaterial(this.baseColor);
-    this.rim = new THREE.Mesh(new THREE.SphereGeometry(0.95,24,18), this.rimMat);
-    this.rim.position.y = 2.6; root.add(this.rim);
-
-    this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(1.25, 1),
+    // lock-on shell sized to ENCLOSE the model (radius scales with MODEL_SCALE,
+    // otherwise it ends up buried inside the larger airframe)
+    this.shell = new THREE.Mesh(new THREE.IcosahedronGeometry(MODEL_SCALE*0.72, 1),
       new THREE.MeshBasicMaterial({ color:c3, wireframe:true, transparent:true,
-        opacity:0.0, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
+        opacity:0.0, fog:false, toneMapped:false, blending:THREE.NormalBlending }));
     this.shell.position.y = 2.6; root.add(this.shell);
 
-    this.claimRing = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.07, 8, 40),
-      new THREE.MeshBasicMaterial({ color:new THREE.Color(CLAIM_COLOR), transparent:true,
-        opacity:0.9, fog:false, toneMapped:false, blending:THREE.AdditiveBlending }));
+    this.claimRing = new THREE.Mesh(new THREE.TorusGeometry(MODEL_SCALE*0.80, 0.10, 8, 44),
+      new THREE.MeshBasicMaterial({ color:new THREE.Color(CLAIM_COLOR), transparent:false,
+        fog:false, toneMapped:false, blending:THREE.NormalBlending }));
     this.claimRing.rotation.x = -Math.PI/2; this.claimRing.position.y = 0.12;
     this.claimRing.visible = false; root.add(this.claimRing);
 
@@ -661,7 +656,6 @@ AFRAME.registerComponent('rf-emitter', {
     if (this.focused === f) return;
     this.focused = f;
     this.beamMat.uniforms.uActive.value = f ? 1.0 : 0.0;
-    this.rimMat.uniforms.uActive.value = f ? 1.0 : 0.0;
     this.model.scale.setScalar(f ? MODEL_SCALE*1.22 : MODEL_SCALE);
     this.shell.material.opacity = f ? 0.9 : 0.0;
   },
@@ -670,7 +664,6 @@ AFRAME.registerComponent('rf-emitter', {
     this.claimRing.visible = this.claimed;
     const c = new THREE.Color(this.claimed ? CLAIM_COLOR : this.baseColor);
     this.beamMat.uniforms.uColor.value.copy(c);
-    this.rimMat.uniforms.uColor.value.copy(c);
     this.model.userData.mats.forEach(function(m){
       m.color.copy(c);
       if (m.emissive) m.emissive.copy(c).multiplyScalar(0.55);
@@ -706,19 +699,17 @@ AFRAME.registerComponent('rf-emitter', {
     }
     const ts = time * 0.001;
     this.beamMat.uniforms.uTime.value = ts;
-    this.rimMat.uniforms.uTime.value = ts;
     this.beam.visible = S.beams;
     this.spine.visible = S.beams;
     const t = ((time + this.phase) % 1800) / 1800;
     const s = 1 + t*4.0;
     this.pulse.scale.set(s,1,s);
-    this.pulse.material.opacity = 0.6 * (1 - t);
+    this.pulse.material.opacity = 0.85 * (1 - t);
     const bob = e.driven
       ? Math.max(2.0, e.pos[1])
       : 2.6 + Math.sin(time*0.0015 + this.phase)*0.10;
     this.model.position.y = this.hit.position.y = bob;
-    this.rim.position.y = this.shell.position.y = bob;
-    this.hot.position.y = this.ghost.position.y = this.back.position.y = bob;
+    this.shell.position.y = this.ghost.position.y = bob;
     if (e.driven) {
       const k = bob / 30;
       this.beam.scale.y = k;  this.beam.position.y = bob/2;
@@ -726,7 +717,6 @@ AFRAME.registerComponent('rf-emitter', {
     }
     this.model.rotation.y += step * 0.4;
     this.ghost.rotation.y = this.model.rotation.y;
-    this.hot.material.opacity = 0.85 + 0.15*Math.sin(time*0.005 + this.phase);
 
     if (time - this._occT > 250) {
       this._occT = time;
@@ -748,7 +738,7 @@ AFRAME.registerComponent('rf-emitter', {
     this.shell.rotation.x += step * 0.15;
     if (this.claimed) {
       this.claimRing.rotation.z += step * 0.8;
-      this.claimRing.material.opacity = 0.65 + Math.sin(time*0.004)*0.25;
+      this.claimRing.scale.setScalar(1 + Math.sin(time*0.004)*0.05);
     }
 
     if (time - this.trailLast > 150) {
@@ -1362,6 +1352,45 @@ AFRAME.registerComponent('control-hub', {
     this.bgMesh.position.set(0, 0, 0.001);
     this.panel.mesh.add(this.bgMesh);
 
+    // ---- joystick pointer ----
+    // Thumbstick drives a cursor across the panel in panel-local metres.
+    // Far more precise than head-gaze for a dense 12-row grid, and it means
+    // the user's head can stay still while selecting.
+    this.cursor = new THREE.Group();
+    const cRing = new THREE.Mesh(new THREE.RingGeometry(0.011, 0.017, 24),
+      new THREE.MeshBasicMaterial({ color:0xffffff, transparent:false,
+        fog:false, toneMapped:false, depthTest:false, side:THREE.DoubleSide }));
+    cRing.renderOrder = 1001;
+    const cDot = new THREE.Mesh(new THREE.CircleGeometry(0.005, 16),
+      new THREE.MeshBasicMaterial({ color:0x39e0ff, transparent:false,
+        fog:false, toneMapped:false, depthTest:false }));
+    cDot.renderOrder = 1002;
+    this.cursor.add(cRing); this.cursor.add(cDot);
+    this.cursor.position.set(0, 0, 0.012);
+    this.panel.mesh.add(this.cursor);
+
+    this.cursorPos = { x:0, y:0 };
+    this.stick = { x:0, y:0 };
+    this.usedStick = false;
+
+    const onStick = function (e) {
+      if (!e.detail) return;
+      const x = (e.detail.x !== undefined) ? e.detail.x : 0;
+      const y = (e.detail.y !== undefined) ? e.detail.y : 0;
+      self.stick.x = x; self.stick.y = y;
+      if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) self.usedStick = true;
+    };
+    this.el.sceneEl.addEventListener('thumbstickmoved', onStick);
+    // raw fallback for controllers whose profile doesn't map thumbstickmoved
+    this.el.sceneEl.addEventListener('axismove', function (e) {
+      if (!e.detail || !e.detail.axis || e.detail.axis.length < 2) return;
+      const a = e.detail.axis;
+      const x = a.length >= 4 ? a[2] : a[0];
+      const y = a.length >= 4 ? a[3] : a[1];
+      self.stick.x = x; self.stick.y = y;
+      if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) self.usedStick = true;
+    });
+
     this.ray = new THREE.Raycaster();
     this.origin = new THREE.Vector3(); this.dir = new THREE.Vector3();
     this.candidate = -1; this.since = 0; this.armed = 0;
@@ -1394,12 +1423,43 @@ AFRAME.registerComponent('control-hub', {
     o.visible = true;
     this.open = true;
     this.candidate = -1; this.armed = 0;
+    // cursor starts dead-centre, which sits in the gap between columns so
+    // the dwell timer can't auto-fire a row the instant the hub appears
+    this.cursorPos.x = 0; this.cursorPos.y = 0;
+    this.usedStick = false;
+    this.setLaserVisible(false);
     this.render();
   },
   close: function () {
     this.open = false;
     this.el.object3D.visible = false;
     this.candidate = -1; this.armed = 0;
+    this.setLaserVisible(true);
+  },
+  // hide the controller ray while the dashboard owns input, restore after
+  setLaserVisible: function (vis) {
+    const rays = document.querySelectorAll('[laser-controls]');
+    for (let i=0;i<rays.length;i++) {
+      try { rays[i].setAttribute('raycaster', 'showLine', vis); } catch (e) {}
+      const lineObj = rays[i].getObject3D('line');
+      if (lineObj) lineObj.visible = vis;
+    }
+  },
+  // which row is under the joystick cursor (panel-local geometry, no raycast)
+  cursorRow: function () {
+    for (let i=0;i<this.ROWS.length;i++) {
+      const row = this.ROWS[i];
+      const cx = row.col===0 ? -0.165 : 0.165;
+      const cy = this.rowY(row.row);
+      if (Math.abs(this.cursorPos.x - cx) <= 0.15 &&
+          Math.abs(this.cursorPos.y - cy) <= 0.031) return i;
+    }
+    return -1;
+  },
+  // joystick takes over once touched; head-gaze remains the fallback so the
+  // hub is still usable if the stick never reports (unknown controller profile)
+  hoveredRow: function () {
+    return this.usedStick ? this.cursorRow() : this.pickRow();
   },
 
   pickRow: function () {
@@ -1427,10 +1487,12 @@ AFRAME.registerComponent('control-hub', {
     if (this._lastTrigger && nowMs - this._lastTrigger < 250) return;
     this._lastTrigger = nowMs;
     if (this.open) {
-      const idx = this.pickRow();
+      const idx = this.hoveredRow();
       if (idx >= 0) { this.activate(idx); return; }
-      if (this.pickPanel()) return;    // on the panel but between rows: ignore
-      this.close();                    // aimed away from the panel: dismiss
+      // joystick mode: cursor is always on the panel, so use the CLOSE row.
+      // gaze mode: aiming away from the panel dismisses it.
+      if (this.usedStick || this.pickPanel()) return;
+      this.close();
       return;
     }
     // hub closed: prefer claiming an emitter under the reticle, else open hub
@@ -1455,7 +1517,17 @@ AFRAME.registerComponent('control-hub', {
     if (!S || !this.open) return;
     if (this.flashT > 0) { this.flashT -= (dt||16); if (this.flashT<=0) { this.flashRow=-1; this.render(); } }
 
-    const gazeIdx = this.pickRow();
+    // integrate thumbstick into cursor position (event only fires on change,
+    // so holding the stick needs per-frame integration)
+    const dts = Math.min(dt||16, 50)/1000;
+    if (Math.abs(this.stick.x) > 0.15 || Math.abs(this.stick.y) > 0.15) {
+      this.cursorPos.x = clamp(this.cursorPos.x + this.stick.x * CONFIG.cursorSpeed * dts, -0.32, 0.32);
+      this.cursorPos.y = clamp(this.cursorPos.y + this.stick.y * CONFIG.cursorSpeed * dts, -0.24, 0.24);
+    }
+    this.cursor.visible = this.usedStick;
+    this.cursor.position.set(this.cursorPos.x, this.cursorPos.y, 0.012);
+
+    const gazeIdx = this.hoveredRow();
     if (gazeIdx !== this.candidate) { this.candidate = gazeIdx; this.since = time; this.armed = 0; }
     let progress = 0;
     if (gazeIdx >= 0) {
