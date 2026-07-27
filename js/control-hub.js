@@ -10,7 +10,7 @@ AFRAME.registerComponent('control-hub', {
     const SCALE_PRESETS = [0.1, 0.05, 0.02, 0.008, 0.25];
 
     this.ROWS = [
-      { key:'mode',     label:'MODE',      col:0, row:0, desc:'Switch demo: SWARM formation flight vs BLOBS emitter classes', get:function(S){ return [S.mode==='swarm'?'SWARM':'BLOBS', '#39e0ff']; },
+      { key:'mode',     label:'MODE',      col:0, row:0, desc:'Switch demo: Swarm Formation flight vs Live Localisation emitter classes', get:function(S){ return [S.mode==='swarm'?'SWARM FORMATION':'LIVE LOCALISATION', '#39e0ff']; },
         run:function(S){ S.mode = S.mode==='swarm' ? 'blobs' : 'swarm'; } },
       { key:'formation',label:'FORMATION', col:0, row:1, desc:'Cycle the 7 formations. Swarm sweeps then morphs into the new shape', get:function(S){
           const sp = document.querySelector('a-scene').components['swarm-player'];

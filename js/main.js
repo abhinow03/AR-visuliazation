@@ -19,7 +19,7 @@
     });
     setInterval(function () {
       const S = window.RFX;
-      modeBtn.textContent = 'MODE: ' + (S.mode==='swarm' ? 'SWARM' : 'BLOBS');
+      modeBtn.textContent = 'MODE: ' + (S.mode==='swarm' ? 'SWARM FORMATION' : 'LIVE LOCALISATION');
       const sc = document.querySelector('a-scene');
       const sp = sc && sc.components['swarm-player'];
       const name = sp ? (sp.pendingFormation || sp.formation) : 'v_shape';
