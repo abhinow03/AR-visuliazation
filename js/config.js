@@ -12,7 +12,25 @@ const CONFIG = {
   convergeShrinkSeconds: 8.0,
   mode: 'swarm',
   showStatus: true,
-  showOverlay: true, showTrails: true
+  showOverlay: true, showTrails: true,
+
+  // ---- rosbridge feed (Stage 1 test) ----
+  // Empty string = feature fully inert: ros-feed.js will not attempt any
+  // connection, no console noise, zero effect on the demo. Set this to test
+  // against the mars-4090 tunnel: 'ws://localhost:9090' with an SSH tunnel
+  // (`ssh -L 9090:localhost:9090 user@host`) mapped to rosbridge_websocket.
+  rosbridgeUrl: '',
+  rosbridgeTopic: '/rf/test_emitters',
+  rosbridgeMsgType: 'std_msgs/String',   // TBD once real base station is known
+  rosbridgeQueueLength: 1,               // ask rosbridge to drop-oldest, keep-newest
+  rosbridgeThrottleMs: 0,                // min ms between messages rosbridge will send us
+  rosReconnectMinMs: 500,
+  rosReconnectMaxMs: 8000,
+  rosFeedStaleMs: 4000,                  // no message for the WHOLE feed -> STALE
+  rosEmitterStaleMs: 2000,               // one emitter not updated -> flag stale
+  rosEmitterLostMs: 30000,               // one emitter not updated -> drop it
+  rosCorrectionMs: 200,                  // blend duration when a new update corrects position
+  rosExtrapolationCapMs: 1500            // stop dead-reckoning further after this long
 };
 
 const CLASSES = {

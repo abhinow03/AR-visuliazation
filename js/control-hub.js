@@ -10,7 +10,7 @@ AFRAME.registerComponent('control-hub', {
     const SCALE_PRESETS = [0.1, 0.05, 0.02, 0.008, 0.25];
 
     this.ROWS = [
-      { key:'mode',     label:'MODE',      col:0, row:0, desc:'Switch demo: Swarm Formation flight vs Live Localisation emitter classes', get:function(S){ return [S.mode==='swarm'?'SWARM FORMATION':'LIVE LOCALISATION', '#39e0ff']; },
+      { key:'mode',     label:'MODE',      col:0, row:0, desc:'Switch demo: SWARM formation flight vs BLOBS emitter classes', get:function(S){ return [S.mode==='swarm'?'SWARM':'BLOBS', '#39e0ff']; },
         run:function(S){ S.mode = S.mode==='swarm' ? 'blobs' : 'swarm'; } },
       { key:'formation',label:'FORMATION', col:0, row:1, desc:'Cycle the 7 formations. Swarm sweeps then morphs into the new shape', get:function(S){
           const sp = document.querySelector('a-scene').components['swarm-player'];
@@ -91,30 +91,29 @@ AFRAME.registerComponent('control-hub', {
     this.stick = { x:0, y:0 };
     this.usedStick = false;
 
-    const onStick = function (e) {
-      if (!e.detail) return;
-      const x = (e.detail.x !== undefined) ? e.detail.x : 0;
-      const y = (e.detail.y !== undefined) ? e.detail.y : 0;
-      self.stick.x = x; self.stick.y = y;
-      if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) self.usedStick = true;
-    };
-    this.el.sceneEl.addEventListener('thumbstickmoved', onStick);
-    // raw fallback for controllers whose profile doesn't map thumbstickmoved
-    this.el.sceneEl.addEventListener('axismove', function (e) {
-      if (!e.detail || !e.detail.axis || e.detail.axis.length < 2) return;
-      const a = e.detail.axis;
-      const x = a.length >= 4 ? a[2] : a[0];
-      const y = a.length >= 4 ? a[3] : a[1];
-      self.stick.x = x; self.stick.y = y;
-      if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) self.usedStick = true;
-    });
+    // ---- grab/drag state ----
+    // Point a controller at the panel and hold GRIP to pick it up; it
+    // follows the hand rigidly (like a Quest system window) until released,
+    // at which point it simply stops moving — that IS the lock, no extra step.
+    this.dragging = false;
+    this.dragController = null;
+    this.dragOffsetMatrix = new THREE.Matrix4();
+    this._gripWasPressed = { left:false, right:false };
+    this._triggerWasPressed = { left:false, right:false };
+    this._grabHover = false;
+    this._m1 = new THREE.Matrix4(); this._m2 = new THREE.Matrix4();
 
     this.ray = new THREE.Raycaster();
     this.origin = new THREE.Vector3(); this.dir = new THREE.Vector3();
     this.candidate = -1; this.since = 0; this.armed = 0;
     this.flashRow = -1; this.flashT = 0;
 
-    // single unified input path: controller trigger in XR, mouse/touch on flat
+    // single unified input path: controller trigger in XR, mouse/touch on flat.
+    // These semantic A-Frame events are kept as one path among several —
+    // pollGamepads() below is the PRIMARY, profile-independent path for both
+    // the thumbstick and the trigger, since 'thumbstickmoved'/'triggerdown'
+    // only fire if A-Frame recognises the specific controller profile, which
+    // is exactly what was failing.
     const handler = function () { self.onTrigger(); };
     this.el.sceneEl.addEventListener('triggerdown', handler);
     window.addEventListener('click', function (e) {
@@ -124,6 +123,89 @@ AFRAME.registerComponent('control-hub', {
     this.render();
   },
   rowY: function (i) { return 0.13 - i*0.062; },
+
+  // Direct WebXR gamepad polling — bypasses A-Frame's controller-profile
+  // detection entirely, so it works even when the semantic events
+  // (thumbstickmoved/triggerdown/gripdown) don't fire for a given headset's
+  // profile string. Called every frame from tick() while the hub is open.
+  pollGamepads: function () {
+    const sceneEl = this.el.sceneEl;
+    const xr = sceneEl.renderer && sceneEl.renderer.xr;
+    const session = xr && xr.getSession && xr.getSession();
+    if (!session || !session.inputSources) return;
+    const self = this;
+
+    session.inputSources.forEach(function (src) {
+      if (!src.gamepad || (src.handedness !== 'left' && src.handedness !== 'right')) return;
+      const gp = src.gamepad, hand = src.handedness;
+
+      // thumbstick: last two axes is the correct pair on every known XR
+      // controller gamepad mapping (2-axis devices use [0,1]; Quest's
+      // 4-axis devices use [2,3] for the stick, [0,1] for an unused pad)
+      const axes = gp.axes;
+      if (axes && axes.length >= 2) {
+        const x = axes[axes.length-2], y = axes[axes.length-1];
+        if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) {
+          self.stick.x = x; self.stick.y = y; self.usedStick = true;
+        } else if (self._activeStickHand === hand) {
+          self.stick.x = 0; self.stick.y = 0;
+        }
+        if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) self._activeStickHand = hand;
+      }
+
+      // trigger: button 0 on the standard XR gamepad mapping. Polled as an
+      // extra rising-edge path alongside triggerdown/click/selectstart —
+      // whichever fires, fires; onTrigger() is debounced so no double actions.
+      const trig = gp.buttons && gp.buttons[0];
+      const trigPressed = !!(trig && trig.pressed);
+      if (trigPressed && !self._triggerWasPressed[hand]) self.onTrigger();
+      self._triggerWasPressed[hand] = trigPressed;
+
+      // grip: button 1 on the standard mapping. Rising edge starts a grab
+      // (if aimed at the panel), falling edge ends it.
+      const grip = gp.buttons && gp.buttons[1];
+      const gripPressed = !!(grip && grip.pressed);
+      if (gripPressed && !self._gripWasPressed[hand]) self.tryStartDrag(hand);
+      if (!gripPressed && self._gripWasPressed[hand] && self.dragging && self.dragHand === hand) self.endDrag();
+      self._gripWasPressed[hand] = gripPressed;
+    });
+  },
+
+  getControllerEl: function (hand) {
+    const els = document.querySelectorAll('[laser-controls]');
+    for (let i=0;i<els.length;i++) {
+      const comp = els[i].components['laser-controls'];
+      if (comp && comp.data && comp.data.hand === hand) return els[i];
+    }
+    return null;
+  },
+
+  // point the controller at the panel and squeeze to pick it up
+  tryStartDrag: function (hand) {
+    if (!this.open || this.dragging) return;
+    const ctrlEl = this.getControllerEl(hand);
+    if (!ctrlEl) return;
+    const ctrlObj = ctrlEl.object3D;
+    const origin = new THREE.Vector3(), dir = new THREE.Vector3();
+    ctrlObj.getWorldPosition(origin);
+    ctrlObj.getWorldDirection(dir);   // already the controller's forward (-Z) direction
+    this.ray.set(origin, dir);
+    if (!this.ray.intersectObject(this.bgMesh, false).length) return;   // not aimed at panel
+
+    ctrlObj.updateMatrixWorld(true);
+    this.el.object3D.updateMatrixWorld(true);
+    this._m1.copy(ctrlObj.matrixWorld).invert();
+    this.dragOffsetMatrix.multiplyMatrices(this._m1, this.el.object3D.matrixWorld);
+    this.dragController = ctrlEl;
+    this.dragHand = hand;
+    this.dragging = true;
+  },
+  endDrag: function () {
+    this.dragging = false;
+    this.dragController = null;
+    // no explicit "lock": we simply stop writing to the transform, so it
+    // stays exactly where it was on the last dragged frame.
+  },
 
   // place the panel in world space, upright, centred in front of the viewer
   openAt: function () {
@@ -145,6 +227,7 @@ AFRAME.registerComponent('control-hub', {
     // the dwell timer can't auto-fire a row the instant the hub appears
     this.cursorPos.x = 0; this.cursorPos.y = 0;
     this.usedStick = false;
+    this.dragging = false; this.dragController = null;
     this.setLaserVisible(false);
     this.render();
   },
@@ -235,6 +318,24 @@ AFRAME.registerComponent('control-hub', {
     if (!S || !this.open) return;
     if (this.flashT > 0) { this.flashT -= (dt||16); if (this.flashT<=0) { this.flashRow=-1; this.render(); } }
 
+    this.pollGamepads();
+
+    // while grabbed, rigidly follow the controller: reapply the same
+    // relative transform captured at grab time, every frame, so the panel
+    // stays exactly where it was picked up on the hand.
+    if (this.dragging && this.dragController) {
+      const ctrlObj = this.dragController.object3D;
+      ctrlObj.updateMatrixWorld(true);
+      this._m2.multiplyMatrices(ctrlObj.matrixWorld, this.dragOffsetMatrix);
+      this._m2.decompose(this.el.object3D.position, this.el.object3D.quaternion, this.el.object3D.scale);
+    }
+
+    // grab-affordance: highlight the panel border when a controller ray
+    // is aimed at it (whether or not grip is currently held)
+    const prevHover = this._grabHover;
+    this._grabHover = this.dragging || this.controllerAimedAtPanel();
+    if (this._grabHover !== prevHover) this.render(this._prevGazeIdx, 0);
+
     // integrate thumbstick into cursor position (event only fires on change,
     // so holding the stick needs per-frame integration)
     const dts = Math.min(dt||16, 50)/1000;
@@ -248,7 +349,7 @@ AFRAME.registerComponent('control-hub', {
     const gazeIdx = this.hoveredRow();
     if (gazeIdx !== this.candidate) { this.candidate = gazeIdx; this.since = time; this.armed = 0; }
     let progress = 0;
-    if (gazeIdx >= 0) {
+    if (gazeIdx >= 0 && !this.dragging) {
       this.armed = time - this.since;
       progress = clamp(this.armed / CONFIG.uiDwellMs, 0, 1);
       if (this.armed > CONFIG.uiDwellMs) { this.activate(gazeIdx); return; }
@@ -262,6 +363,22 @@ AFRAME.registerComponent('control-hub', {
     if (!this._lastFull || time - this._lastFull > 400) { this._lastFull = time; this.render(gazeIdx, progress); }
   },
 
+  // any controller's aiming ray currently on the panel backing — used only
+  // for the grab-affordance highlight, independent of head-gaze/cursor
+  controllerAimedAtPanel: function () {
+    const hands = ['left','right'];
+    for (let i=0;i<hands.length;i++) {
+      const ctrlEl = this.getControllerEl(hands[i]);
+      if (!ctrlEl) continue;
+      const obj = ctrlEl.object3D;
+      const origin = new THREE.Vector3(), dir = new THREE.Vector3();
+      obj.getWorldPosition(origin); obj.getWorldDirection(dir);
+      this.ray.set(origin, dir);
+      if (this.ray.intersectObject(this.bgMesh, false).length) return true;
+    }
+    return false;
+  },
+
   render: function (hoverIdx, hoverProg) {
     const S = window.RFX; if (!S) return;
     const ctx = this.panel.ctx, cv = this.panel.cv, W = cv.width, H = cv.height;
@@ -269,7 +386,13 @@ AFRAME.registerComponent('control-hub', {
     ctx.clearRect(0,0,W,H);
     ctx.fillStyle = 'rgba(2,10,7,0.95)';
     roundRect(ctx,4,4,W-8,H-8,20); ctx.fill();
-    ctx.strokeStyle = '#2dffa0'; ctx.lineWidth = 5; ctx.stroke();
+    ctx.strokeStyle = this._grabHover ? '#39e0ff' : '#2dffa0';
+    ctx.lineWidth = this._grabHover ? 8 : 5;
+    ctx.stroke();
+    if (this.dragging) {
+      ctx.strokeStyle = 'rgba(57,224,255,0.35)'; ctx.lineWidth = 16;
+      roundRect(ctx,4,4,W-8,H-8,20); ctx.stroke();
+    }
 
     ctx.textBaseline='middle'; ctx.textAlign='center';
     ctx.fillStyle = '#2dffa0';
@@ -277,7 +400,10 @@ AFRAME.registerComponent('control-hub', {
     ctx.fillText('CONTROL HUB', W/2, H*0.065);
     ctx.fillStyle = '#7fae9c';
     ctx.font = Math.round(H*0.032) + 'px ui-monospace, monospace';
-    ctx.fillText('gaze a row and hold, or pull trigger \u00b7 trigger off-panel to close', W/2, H*0.115);
+    ctx.fillText(this.dragging ? 'release grip to place'
+      : (this._grabHover ? 'hold GRIP to move this panel'
+        : 'gaze a row and hold, or pull trigger \u00b7 trigger off-panel to close'),
+      W/2, H*0.115);
 
     ctx.strokeStyle = 'rgba(45,255,160,0.18)'; ctx.lineWidth=2;
     ctx.beginPath(); ctx.moveTo(W/2, H*0.16); ctx.lineTo(W/2, H*0.84); ctx.stroke();
@@ -363,10 +489,19 @@ AFRAME.registerComponent('control-hub', {
     occ = S.occluderCount || 0;
     this._forceStatus = (anchor === 'PENDING');
     const good = anchor==='LOCKED' && track==='OK';
+    // ROS feed status, folded onto the existing footer — only shown once
+    // CONFIG.rosbridgeUrl is actually set, so the footer is unchanged for
+    // anyone not testing the live feed.
+    let rosText = '';
+    if (S.ros && S.ros.status !== 'disabled') {
+      const rs = S.ros.status.toUpperCase();
+      const n = S.ros.emitters ? S.ros.emitters.size : 0;
+      rosText = '   ROS ' + rs + ' (' + n + ')';
+    }
     return {
       color: good ? '#2dffa0' : (anchor==='PENDING' ? '#ffb454' : '#ff5252'),
       line1: 'ANCHOR ' + anchor + '   TRK ' + track + '   OCC ' + occ,
-      line2: 'HEAD ' + hx + '/' + hz + 'm'
+      line2: 'HEAD ' + hx + '/' + hz + 'm' + rosText
     };
   }
 });

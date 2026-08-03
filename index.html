@@ -18,6 +18,7 @@
 <script src="js/config.js"></script>
 <script src="js/utils.js"></script>
 <script src="js/formation.js"></script>
+<script src="js/ros-feed.js"></script>
 
 <script src="js/xr-launcher.js"></script>
 <script src="js/anchor-lock.js"></script>
@@ -39,9 +40,9 @@
   <h1>RF EMITTER HIGHLIGHTER</h1>
   <p>Standalone Meta Quest Browser &mdash; not over Link.<br>
      One control hub, gaze+hold, trigger, or any click.<br>
-     Two demos: Live Localisation (static classes) and Swarm Formation (formation classifier).</p>
+     Two demos: BLOBS (static classes) and SWARM (formation classifier).</p>
   <div id="demoBtns">
-    <button id="btn-mode">MODE: SWARM FORMATION</button>
+    <button id="btn-mode">MODE: SWARM</button>
     <button id="btn-formation">FORMATION: V SHAPE</button>
   </div>
   <div class="btns">
@@ -57,7 +58,7 @@
   vr-mode-ui="enabled: false"
   webxr="referenceSpaceType: local-floor; optionalFeatures: local-floor, bounded-floor, hand-tracking, anchors"
   renderer="antialias: true; foveationLevel: 1; colorManagement: true; alpha: true"
-  xr-launcher gaze-picker real-occluders swarm-player>
+  xr-launcher gaze-picker real-occluders swarm-player ros-feed>
 
   <a-entity light="type: ambient; color:#8899aa; intensity:0.75"></a-entity>
   <!-- key light: gives flat-shaded facets distinct values so low-poly models
@@ -82,7 +83,8 @@
         color="#2dffa0" material="shader:flat; fog:false"></a-ring>
 
       <!-- classifier readout: docked top-right corner, not floating centre -->
-      <a-entity formation-banner position="0.30 0.19 -0.85" rotation="-8 -12 0"></a-entity>
+      <!-- position/rotation computed dynamically in formation-banner.js from the real camera FOV -->
+      <a-entity formation-banner></a-entity>
       <a-entity id="gaze-hud" gaze-hud position="0 -0.26 -0.70" rotation="12 0 0"></a-entity>
     </a-camera>
     <a-entity laser-controls="hand:left"></a-entity>
