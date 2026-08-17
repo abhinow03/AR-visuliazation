@@ -29,113 +29,163 @@ function makeBeamMaterial(colorHex) {
   });
 }
 
-// Confidence [0,1] -> emissive intensity: low confidence reads as a dim,
-// uncertain indicator; high confidence reads as a bright, saturated one.
+// One shared, lazily-built tileable carbon-weave texture, reused across
+// every body material (built once, not per-instance — cheap in memory and
+// GPU state). A fine diagonal crosshatch in dark-on-darker grey; enough to
+// break up the "flat plastic" read at close range without needing a real
+// texture asset file.
+let _carbonTex = null;
+function getCarbonWeaveTexture() {
+  if (_carbonTex) return _carbonTex;
+  const size = 128;
+  const cv = document.createElement('canvas');
+  cv.width = size; cv.height = size;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#141517'; ctx.fillRect(0, 0, size, size);
+  ctx.strokeStyle = 'rgba(60,64,70,0.55)'; ctx.lineWidth = 1.4;
+  const step = 8;
+  for (let i = -size; i < size*2; i += step) {
+    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i+size, size); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(i, size); ctx.lineTo(i+size, 0); ctx.stroke();
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  for (let i=0;i<40;i++) ctx.fillRect(Math.random()*size, Math.random()*size, 2, 2);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(3, 3);
+  _carbonTex = tex;
+  return tex;
+}
+
+// Confidence [0,1] -> emissive intensity. Kept deliberately dim/narrow —
+// this is a small status indicator, not a beacon: a low-confidence read
+// should look like a barely-lit LED, a high-confidence read a solid,
+// steady one, never a glow that competes with the hardware silhouette.
 function confidenceToGlow(confidence) {
   const c = (typeof confidence === 'number' && isFinite(confidence)) ? clamp(confidence, 0, 1) : 0.7;
-  return 0.6 + c * 1.8;   // range ~0.6 (dim) .. 2.4 (vivid)
+  return 0.35 + c * 0.85;   // range ~0.35 (barely lit) .. 1.2 (solid, still not blown out)
 }
 
 function buildEmitterModel(shape, color, confidence) {
   const g = new THREE.Group();
   const bodyMats = [], accentMats = [];
   const glow = confidenceToGlow(confidence);
+  const carbonTex = getCarbonWeaveTexture();
 
-  // Sleek matte/glossy black chassis — MeshStandardMaterial for real
-  // roughness/metalness response (MeshLambertMaterial has neither). No
-  // envmap is set up in this scene, so metalness is kept moderate rather
-  // than near-1: a fully metallic material with no environment to reflect
-  // reads as flat near-black instead of glossy, since real metals derive
-  // most of their look from reflected environment, not diffuse light.
+  // Gunmetal/carbon chassis. Lower metalness than a pure-metal look would
+  // want (there's no environment map in this scene, so high metalness with
+  // nothing to reflect just goes flat dark) — the carbon-weave map supplies
+  // the surface detail instead of relying on specular alone.
   const BODY = () => {
     const m = new THREE.MeshStandardMaterial({
-      color: 0x0b0d10, roughness: 0.35, metalness: 0.55, flatShading: true,
-      fog: false, toneMapped: false
+      color: 0x1b1d20, map: carbonTex, roughness: 0.55, metalness: 0.35,
+      flatShading: true, fog: false, toneMapped: false
     });
     bodyMats.push(m); return m;
   };
-  // Glowing indicator marker: dark base so diffuse shading stays subdued,
-  // full-saturation emissive so it genuinely reads as an active light
-  // rather than a shaded plastic part. Intensity carries confidence.
+  // Bright bare-metal hardware: rotor hubs, screws, joints. Non-glowing —
+  // this is what reads as "small functional metal part", not an indicator.
+  const TRIM = () => new THREE.MeshStandardMaterial({
+    color: 0x9aa1ab, roughness: 0.28, metalness: 0.85, flatShading: true,
+    fog: false, toneMapped: false
+  });
+  // Small glowing status indicator — deliberately tiny geometry (a strip or
+  // dot), desaturated slightly from the raw class colour so it reads as a
+  // status LED against dark hardware rather than a coloured surface.
   const ACCENT = () => {
+    const c = color.clone().multiplyScalar(0.88);
     const m = new THREE.MeshStandardMaterial({
-      color: color.clone().multiplyScalar(0.15), emissive: color.clone(),
-      emissiveIntensity: glow, roughness: 0.4, metalness: 0.2, flatShading: true,
+      color: c.clone().multiplyScalar(0.12), emissive: c,
+      emissiveIntensity: glow, roughness: 0.5, metalness: 0.1, flatShading: true,
       fog: false, toneMapped: false
     });
     accentMats.push(m); return m;
   };
-  // Faint always-on metallic trim line (distinct from the gaze-triggered
-  // lock-on shell elsewhere): a thin neutral highlight, not class-coloured.
-  const TRIM = () => new THREE.MeshStandardMaterial({
-    color: 0x3a4048, roughness: 0.2, metalness: 0.8, flatShading: true,
-    fog: false, toneMapped: false
-  });
 
   if (shape === 'drone') {
-    // hexagonal "puck" chassis reads as designed hardware, not a cube
-    g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.30, 0.32, 0.15, 6), BODY()));
-    const armG = new THREE.CylinderGeometry(0.032, 0.032, 0.9, 6);
+    // compact rectangular avionics housing, not a symmetric puck
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.11, 0.46), BODY());
+    g.add(housing);
+    // small raised sensor/GPS bump for silhouette detail
+    const bump = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.05, 0.14), BODY());
+    bump.position.set(0, 0.08, -0.08); g.add(bump);
+    // corner screws — tiny bright-metal dots, hardware realism
+    [[0.12,0.19],[0.12,-0.19],[-0.12,0.19],[-0.12,-0.19]].forEach(function(p){
+      const s = new THREE.Mesh(new THREE.SphereGeometry(0.014,5,4), TRIM());
+      s.position.set(p[0],0.058,p[1]); g.add(s);
+    });
+    // slim motor arms — structural, same carbon finish as the body
+    const armG = new THREE.CylinderGeometry(0.020, 0.020, 0.62, 6);
     for (let i=0;i<2;i++){
       const arm = new THREE.Mesh(armG, BODY());
       arm.rotation.z = Math.PI/2; arm.rotation.y = (i===0?1:-1)*Math.PI/4;
       g.add(arm);
     }
-    // glowing rotor rings — the drone's active/live indicator
-    const rotG = new THREE.TorusGeometry(0.20, 0.026, 6, 14);
-    [[0.45,0.45],[0.45,-0.45],[-0.45,0.45],[-0.45,-0.45]].forEach(function(p){
-      const r = new THREE.Mesh(rotG, ACCENT());
-      r.rotation.x = Math.PI/2; r.position.set(p[0],0.10,p[1]);
-      g.add(r);
-      const hub = new THREE.Mesh(new THREE.SphereGeometry(0.045,6,5), TRIM());
-      hub.position.set(p[0],0.10,p[1]); g.add(hub);
+    // small functional rotor hubs — bare metal, NOT glowing rings
+    [[0.32,0.32],[0.32,-0.32],[-0.32,0.32],[-0.32,-0.32]].forEach(function(p){
+      const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.055,0.06,0.045,10), TRIM());
+      hub.position.set(p[0],0.055,p[1]); g.add(hub);
+      // two thin blades per rotor — cheap, reads as an actual propeller
+      for (let bIdx=0; bIdx<2; bIdx++){
+        const blade = new THREE.Mesh(new THREE.BoxGeometry(0.18,0.006,0.028), BODY());
+        blade.position.set(p[0],0.075,p[1]); blade.rotation.y = bIdx*Math.PI/2 + Math.PI/6;
+        g.add(blade);
+      }
     });
-    // sensor-eye: a small glowing dome on top, the classification indicator
-    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.07, 10, 6, 0, Math.PI*2, 0, Math.PI/2), ACCENT());
-    eye.position.y = 0.08; g.add(eye);
+    // ONE small status strip — the only glowing element on the whole drone
+    const strip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.014, 0.20), ACCENT());
+    strip.position.set(0, 0.065, 0.10); g.add(strip);
   } else if (shape === 'remote') {
     g.add(new THREE.Mesh(new THREE.BoxGeometry(0.5,0.14,0.75), BODY()));
-    const antG = new THREE.CylinderGeometry(0.022,0.022,0.55,6);
+    [[0.20,0.05],[-0.20,0.05],[0.20,-0.05],[-0.20,-0.05]].forEach(function(p){
+      const s = new THREE.Mesh(new THREE.SphereGeometry(0.013,5,4), TRIM());
+      s.position.set(p[0],0.075,p[1]); g.add(s);
+    });
+    const antG = new THREE.CylinderGeometry(0.018,0.018,0.55,6);
     [-0.16,0.16].forEach(function(x,i){
       const a = new THREE.Mesh(antG, BODY());
       a.position.set(x,0.32,-0.28); a.rotation.x = -0.5; a.rotation.z = i===0?0.25:-0.25;
       g.add(a);
-      // glowing antenna tip: the active-transmit indicator
-      const tip = new THREE.Mesh(new THREE.SphereGeometry(0.045,6,5), ACCENT());
+      // small transmit-indicator dot, not a bright ball
+      const tip = new THREE.Mesh(new THREE.SphereGeometry(0.028,6,5), ACCENT());
       tip.position.set(x + (i===0?0.13:-0.13), 0.55, -0.53); g.add(tip);
     });
     [-0.13,0.13].forEach(function(x){
-      const stick = new THREE.Mesh(new THREE.SphereGeometry(0.06,8,6), TRIM());
+      const stick = new THREE.Mesh(new THREE.SphereGeometry(0.05,8,6), TRIM());
       stick.position.set(x,0.11,0.16); g.add(stick);
     });
   } else if (shape === 'antenna') {
-    const base = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.14,0.4), BODY());
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.36,0.13,0.36), BODY());
     base.position.y = -0.35; g.add(base);
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.035,0.045,0.8,6), BODY());
+    [[0.13,0.13],[0.13,-0.13],[-0.13,0.13],[-0.13,-0.13]].forEach(function(p){
+      const s = new THREE.Mesh(new THREE.SphereGeometry(0.012,5,4), TRIM());
+      s.position.set(p[0],-0.29,p[1]); g.add(s);
+    });
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.028,0.038,0.8,6), BODY());
     pole.position.y = 0.05; g.add(pole);
-    // glowing transmit tip
-    const tip = new THREE.Mesh(new THREE.SphereGeometry(0.065,8,6), ACCENT());
+    const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,0.03,8), TRIM());
+    collar.position.y = -0.30; g.add(collar);
+    // small transmit tip, two thin signal-wave rings (down from three, thinner, dimmer)
+    const tip = new THREE.Mesh(new THREE.SphereGeometry(0.04,8,6), ACCENT());
     tip.position.y = 0.48; g.add(tip);
-    // signal-wave rings: glowing, growing outward — the wifi/RF icon language
-    [0.22,0.38,0.54].forEach(function(r){
-      const arc = new THREE.Mesh(new THREE.TorusGeometry(r,0.020,6,14,Math.PI*0.55), ACCENT());
+    [0.26,0.42].forEach(function(r){
+      const arc = new THREE.Mesh(new THREE.TorusGeometry(r,0.012,6,14,Math.PI*0.55), ACCENT());
       arc.position.y = 0.48; arc.rotation.z = Math.PI*0.225;
       g.add(arc);
     });
   } else {
-    // general floater: low-poly geodesic sensor-pod body, glowing
-    // equatorial band, thin always-on metallic trim ring
+    // general floater: faceted sensor-pod body, thin bright metal trim,
+    // one narrow glowing band rather than a broad equatorial glow
     g.add(new THREE.Mesh(new THREE.IcosahedronGeometry(0.5, 1), BODY()));
-    const eq = new THREE.Mesh(new THREE.TorusGeometry(0.68,0.028,6,24), ACCENT());
-    eq.rotation.x = Math.PI/2; g.add(eq);
-    const trim = new THREE.Mesh(new THREE.TorusGeometry(0.58,0.008,4,24), TRIM());
+    const trim = new THREE.Mesh(new THREE.TorusGeometry(0.58,0.010,4,24), TRIM());
     trim.rotation.x = Math.PI/2; trim.rotation.z = Math.PI/3; g.add(trim);
+    const band = new THREE.Mesh(new THREE.TorusGeometry(0.68,0.014,6,24), ACCENT());
+    band.rotation.x = Math.PI/2; g.add(band);
   }
   g.userData.bodyMats = bodyMats;
   g.userData.accentMats = accentMats;
-  g.userData.mats = accentMats;   // legacy alias: existing callers that recolor
-                                   // "the whole model" now correctly touch only
-                                   // the glowing accent parts, not the chassis
+  g.userData.mats = accentMats;   // legacy alias: recolor-on-claim touches
+                                   // only the small indicator, never the chassis
   return g;
 }
 
@@ -250,8 +300,9 @@ AFRAME.registerComponent('rf-emitter', {
     const c = new THREE.Color(this.claimed ? CLAIM_COLOR : this.baseColor);
     this.beamMat.uniforms.uColor.value.copy(c);
     this.model.userData.mats.forEach(function(m){
-      m.color.copy(c).multiplyScalar(0.15);
-      if (m.emissive) m.emissive.copy(c);   // emissiveIntensity (confidence) stays as-created
+      const ac = c.clone().multiplyScalar(0.88);   // same desaturation as creation-time ACCENT()
+      m.color.copy(ac).multiplyScalar(0.12);
+      if (m.emissive) m.emissive.copy(ac);         // emissiveIntensity (confidence) stays as-created
     });
     this.ghost.userData.mats.forEach(function(m){ m.color.copy(c); });
     this.spine.material.color.copy(c);
