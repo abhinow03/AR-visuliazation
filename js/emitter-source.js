@@ -8,6 +8,7 @@ AFRAME.registerComponent('emitter-source', {
       mode:CONFIG.mode,
       transState:null, transFrom:null, transTo:null, transAlpha:0,
       selectedFormation:'v_shape',
+      liveFeed:false,   // set true by ros-feed.js once the rosbridge connection is up
       classLabel:null, classConf:null,
       showOverlay:CONFIG.showOverlay, showTrails:CONFIG.showTrails,
       home: ALL_EMITTERS.map(function (e) { return { pos:e.pos.slice(), vel:e.vel.slice() }; })

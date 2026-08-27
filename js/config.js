@@ -12,7 +12,15 @@ const CONFIG = {
   convergeShrinkSeconds: 8.0,
   mode: 'swarm',
   showStatus: true,
-  showOverlay: true, showTrails: true
+  showOverlay: true, showTrails: true,
+
+  // rosbridge (RF_Swarm live feed). Deliberately NOT a hardcoded URL: the
+  // tunnel is ephemeral (changes every restart) and this repo is public on
+  // GitHub Pages, so the live endpoint is passed at runtime via ?ros=<wss url>
+  // instead of being committed — see ros-feed.js. No URL = scripted demo only.
+  rosbridgeUrl: new URLSearchParams(location.search).get('ros') || '',
+  rosbridgeTopic: '/scene_update',
+  rosbridgeMsgType: 'std_msgs/String'
 };
 
 const CLASSES = {
