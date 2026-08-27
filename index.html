@@ -33,6 +33,7 @@
 <script src="js/control-hub.js"></script>
 <script src="js/emitter-source.js"></script>
 <script src="js/ros-feed.js"></script>
+<script src="js/feed-status.js"></script>
 </head>
 
 <body>
@@ -85,6 +86,7 @@
       <!-- classifier readout: docked top-right corner, not floating centre -->
       <a-entity formation-banner position="0.30 0.19 -0.85" rotation="-8 -12 0"></a-entity>
       <a-entity id="gaze-hud" gaze-hud position="0 -0.26 -0.70" rotation="12 0 0"></a-entity>
+      <a-entity feed-status position="-0.32 0.19 -0.85" rotation="-8 12 0"></a-entity>
     </a-camera>
     <a-entity laser-controls="hand:left"></a-entity>
     <a-entity laser-controls="hand:right"></a-entity>
