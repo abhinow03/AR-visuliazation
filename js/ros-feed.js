@@ -43,15 +43,35 @@
     S.transState = 'settled';
   }
 
+  // The real classifier reads noisy EKF-tracked positions (not idealized
+  // formation shapes), so raw per-message labels can flicker between two
+  // adjacent classes (documented Phase-5 finding: e.g. encirclement <->
+  // dispersed under EKF position RMSE). Committing on a majority vote over
+  // a short rolling window turns that flicker into a stable hold, without
+  // faking a transition that isn't actually happening. class_probabilities
+  // (the actual confidence distribution) is applied on every message
+  // unthrottled — only the single displayed classLabel is debounced.
+  const FORMATION_HISTORY_LEN = 5;
+  const FORMATION_VOTE_MIN = 3;   // >=3 of last 5 must agree to switch
+  let formationHistory = [];
+  let committedLabel = null;
+
   function applyFormation(msg) {
     const S = window.RFX;
     if (!S || typeof FORMATION_NAMES === 'undefined') return;
-    S.classLabel = msg.formation_class;
     if (Array.isArray(msg.class_probabilities)) {
       S.classConf = FORMATION_NAMES.map(function (name, i) {
         return [name, msg.class_probabilities[i] || 0];
       });
     }
+    formationHistory.push(msg.formation_class);
+    if (formationHistory.length > FORMATION_HISTORY_LEN) formationHistory.shift();
+    if (committedLabel === null) { committedLabel = msg.formation_class; }
+    else if (msg.formation_class !== committedLabel) {
+      const agree = formationHistory.filter(function (l) { return l === msg.formation_class; }).length;
+      if (agree >= FORMATION_VOTE_MIN) committedLabel = msg.formation_class;
+    }
+    S.classLabel = committedLabel;
   }
 
   function hideScriptedOverlay() {
@@ -71,6 +91,7 @@
       console.log('[ros-feed] connected:', url);
       ws.send(JSON.stringify({ op: 'subscribe', topic: CONFIG.rosbridgeTopic, type: CONFIG.rosbridgeMsgType }));
       ws.send(JSON.stringify({ op: 'subscribe', topic: '/formation' }));   // type auto-detected
+      formationHistory = []; committedLabel = null;   // fresh vote state per connection
       window.RFX.liveFeed = true;
       hideScriptedOverlay();
     };

@@ -1,7 +1,10 @@
 /* gaze-hud.js — contextual info box shown while gazing at a claimed/focused emitter. */
 AFRAME.registerComponent('gaze-hud', {
   init: function () {
-    this.panel = makeCanvasPanel(0.46, 0.26, 2200);
+    // taller than the original 0.26m to fit the live RF_Swarm metric row
+    // (status/pos_sigma/gdop) without crowding or overflowing the existing
+    // range/speed/bearing row.
+    this.panel = makeCanvasPanel(0.46, 0.34, 2200);
     this.panel.mesh.visible = false;
     this.el.object3D.add(this.panel.mesh);
     this.flashT = 0; this.flashOn = false; this.last = 0;
@@ -29,16 +32,16 @@ AFRAME.registerComponent('gaze-hud', {
     ctx.strokeStyle = color; ctx.lineWidth = 6; ctx.stroke();
     ctx.textBaseline='middle';
     ctx.fillStyle = color; ctx.textAlign='left';
-    ctx.font = 'bold ' + Math.round(H*0.155) + 'px ui-monospace, monospace';
-    ctx.fillText(e.id, W*0.055, H*0.16);
+    ctx.font = 'bold ' + Math.round(H*0.12) + 'px ui-monospace, monospace';
+    ctx.fillText(e.id, W*0.055, H*0.12);
     ctx.textAlign='right';
-    ctx.fillText(Math.round(e.confidence*100) + '%', W*0.945, H*0.16);
+    ctx.fillText(Math.round(e.confidence*100) + '%', W*0.945, H*0.12);
     ctx.strokeStyle = color; ctx.globalAlpha=0.4; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.moveTo(W*0.055,H*0.27); ctx.lineTo(W*0.945,H*0.27); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W*0.055,H*0.205); ctx.lineTo(W*0.945,H*0.205); ctx.stroke();
     ctx.globalAlpha=1;
     ctx.fillStyle = g.claimed ? CLAIM_COLOR : '#eafff6'; ctx.textAlign='left';
-    ctx.font = 'bold ' + Math.round(H*0.115) + 'px ui-monospace, monospace';
-    ctx.fillText(g.claimed ? 'HANDLED \u2713' : CLASSES[e.cls].name, W*0.055, H*0.40);
+    ctx.font = 'bold ' + Math.round(H*0.088) + 'px ui-monospace, monospace';
+    ctx.fillText(g.claimed ? 'HANDLED \u2713' : CLASSES[e.cls].name, W*0.055, H*0.30);
     const hd = bearing(e.vel[0], e.vel[2]);
     const cols = [
       ['RANGE', Math.round(range) + 'm'],
@@ -48,12 +51,32 @@ AFRAME.registerComponent('gaze-hud', {
     for (let i=0;i<3;i++){
       const x = W*(0.19 + i*0.31);
       ctx.textAlign='center';
-      ctx.fillStyle='#7fae9c'; ctx.font = Math.round(H*0.082) + 'px ui-monospace, monospace';
-      ctx.fillText(cols[i][0], x, H*0.585);
-      ctx.fillStyle='#eafff6'; ctx.font='bold ' + Math.round(H*0.135) + 'px ui-monospace, monospace';
-      ctx.fillText(cols[i][1], x, H*0.72);
+      ctx.fillStyle='#7fae9c'; ctx.font = Math.round(H*0.062) + 'px ui-monospace, monospace';
+      ctx.fillText(cols[i][0], x, H*0.42);
+      ctx.fillStyle='#eafff6'; ctx.font='bold ' + Math.round(H*0.10) + 'px ui-monospace, monospace';
+      ctx.fillText(cols[i][1], x, H*0.51);
     }
-    const by = H*0.87, bh = H*0.075, bx = W*0.055, bw = W*0.89;
+    // live RF_Swarm-only metrics (status/pos_sigma/gdop) \u2014 undefined for the
+    // scripted blobs demo, which never sets these on its emitter objects.
+    if (e.status !== undefined || e.posSigma !== undefined || e.gdop !== undefined) {
+      const live = [
+        ['STATUS', (e.status || '\u2014').toUpperCase()],
+        ['\u03c3 POS', e.posSigma != null ? e.posSigma.toFixed(1) + 'm' : '\u2014'],
+        ['GDOP',   e.gdop != null ? e.gdop.toFixed(2) : '\u2014']
+      ];
+      ctx.strokeStyle = color; ctx.globalAlpha=0.25; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(W*0.055,H*0.575); ctx.lineTo(W*0.945,H*0.575); ctx.stroke();
+      ctx.globalAlpha=1;
+      for (let i=0;i<3;i++){
+        const x = W*(0.19 + i*0.31);
+        ctx.textAlign='center';
+        ctx.fillStyle='#7fae9c'; ctx.font = Math.round(H*0.062) + 'px ui-monospace, monospace';
+        ctx.fillText(live[i][0], x, H*0.65);
+        ctx.fillStyle = color; ctx.font='bold ' + Math.round(H*0.10) + 'px ui-monospace, monospace';
+        ctx.fillText(live[i][1], x, H*0.74);
+      }
+    }
+    const by = H*0.90, bh = H*0.062, bx = W*0.055, bw = W*0.89;
     ctx.fillStyle='rgba(255,255,255,0.10)';
     roundRect(ctx,bx,by-bh/2,bw,bh,bh/2); ctx.fill();
     if (this.flashT > 0) {

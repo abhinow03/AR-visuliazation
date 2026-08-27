@@ -83,10 +83,12 @@
       <a-ring id="reticle" position="0 -0.02 -1.2" radius-inner="0.005" radius-outer="0.009"
         color="#2dffa0" material="shader:flat; fog:false"></a-ring>
 
-      <!-- classifier readout: docked top-right corner, not floating centre -->
-      <a-entity formation-banner position="0.30 0.19 -0.85" rotation="-8 -12 0"></a-entity>
+      <!-- classifier readout + live/sim tag: docked corners just above centre,
+           within normal forward gaze (was y=0.19, needed a full upward glance
+           on Quest; y=0.06 sits inside the comfortable FOV band). -->
+      <a-entity formation-banner position="0.28 0.06 -0.78" rotation="-4 -10 0"></a-entity>
       <a-entity id="gaze-hud" gaze-hud position="0 -0.26 -0.70" rotation="12 0 0"></a-entity>
-      <a-entity feed-status position="-0.32 0.19 -0.85" rotation="-8 12 0"></a-entity>
+      <a-entity feed-status position="-0.28 0.06 -0.78" rotation="-4 10 0"></a-entity>
     </a-camera>
     <a-entity laser-controls="hand:left"></a-entity>
     <a-entity laser-controls="hand:right"></a-entity>
