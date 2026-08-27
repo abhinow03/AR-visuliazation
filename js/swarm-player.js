@@ -57,6 +57,7 @@ AFRAME.registerComponent('swarm-player', {
   tick: function (time, dt) {
     if (!this.comps.length) return;
     const S = window.RFX;
+    if (S.liveFeed) return;   // ros-feed.js owns pos/vel/classification while connected
     const stepped = S.playing ? Math.min(dt||16,50)/1000 * S.speed : 0;
     const now = time/1000;
     let offsets, alpha = 1;
