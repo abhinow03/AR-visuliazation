@@ -1,6 +1,17 @@
 /* rf-emitter.js — the per-emitter beacon: model, beam, occlusion ghost,
    claim state, breadcrumb trail. Includes its sole-consumer helpers
    (model builder, wireframe clone, beam shader) rather than utils.js. */
+
+// Confidence LED gradient for live RF_Swarm emitters — reuses feed-status.js's
+// established "live/good" green rather than inventing a new color; low end is a
+// coral distinct from CLAIM_COLOR's amber so a low-confidence emitter is never
+// visually confused with a claimed one.
+const LIVE_GOOD_COLOR = '#2dffa0';
+const LIVE_BAD_COLOR = '#ff6b5c';
+function lerpColorHex(c1, c2, t) {
+  const a = new THREE.Color(c1), b = new THREE.Color(c2);
+  return a.lerp(b, Math.max(0, Math.min(1, t)));
+}
 function makeBeamMaterial(colorHex) {
   return new THREE.ShaderMaterial({
     transparent:true, depthWrite:false, blending:THREE.NormalBlending, side:THREE.DoubleSide,
@@ -153,6 +164,16 @@ AFRAME.registerComponent('rf-emitter', {
     this.pulse.material.depthTest = false; this.pulse.renderOrder = 8;
     this.pulse.rotation.x = -Math.PI/2; this.pulse.position.y = 0.05; root.add(this.pulse);
 
+    // uncertainty ring (live RF_Swarm emitters only): a thin outline whose RADIUS
+    // scales with pos_sigma, so a wide ring reads at a glance as "the system isn't
+    // sure where this is" — no new color, one geometric encoding. Starts invisible;
+    // tick() sizes/shows it only for driven emitters carrying a real posSigma.
+    this.uncRing = new THREE.Mesh(new THREE.RingGeometry(2.35,2.5,48),
+      new THREE.MeshBasicMaterial({ color:LIVE_GOOD_COLOR, transparent:true, opacity:0.0,
+        side:THREE.DoubleSide, depthTest:false, fog:false, toneMapped:false }));
+    this.uncRing.renderOrder = 8;
+    this.uncRing.rotation.x = -Math.PI/2; this.uncRing.position.y = 0.04; root.add(this.uncRing);
+
     const shape = CLASSES[e.cls].shape || 'orb';
     this.model = buildEmitterModel(shape, c3);
     this.model.position.y = 2.6; this.model.scale.setScalar(MODEL_SCALE);
@@ -260,6 +281,37 @@ AFRAME.registerComponent('rf-emitter', {
     this.model.rotation.y += step * 0.4;
     this.ghost.rotation.y = this.model.rotation.y;
 
+    // live-only encoding: track STATUS -> form/opacity, CONFIDENCE -> LED color,
+    // pos_sigma -> uncertainty ring radius. Two encodings, no new colors beyond
+    // the existing LIVE_GOOD/LIVE_BAD pair. No-op for scripted/blobs emitters,
+    // which never set e.status.
+    this._statusLost = false;
+    if (e.driven && e.status !== undefined) {
+      const coasting = e.status === 2, lost = e.status === 3;
+      this._statusLost = lost;
+      const modelOpacity = coasting ? 0.35 : 1.0;
+      this.model.userData.mats.forEach(function (m) {
+        m.transparent = modelOpacity < 1; m.opacity = modelOpacity;
+      });
+      this.model.visible = !lost;
+      this.pulse.visible = !coasting && !lost;          // "no LED" while coasting/lost
+      this.ring.visible = !lost;
+      if (!this.claimed) {
+        const conf = e.confidence != null ? e.confidence : 1.0;
+        this.ring.material.color.copy(lerpColorHex(LIVE_BAD_COLOR, LIVE_GOOD_COLOR, conf));
+      }
+      if (e.posSigma != null && !lost) {
+        // sigma in metres -> ring radius scale; clamped so it stays legible at
+        // both ends (a near-zero sigma still shows a thin ring, a huge one
+        // doesn't blow past the model's own footprint)
+        const sc = Math.max(1.0, Math.min(2.2, 1.0 + e.posSigma / 25));
+        this.uncRing.scale.set(sc, 1, sc);
+        this.uncRing.material.opacity = 0.4;
+      } else {
+        this.uncRing.material.opacity = 0.0;
+      }
+    }
+
     if (time - this._occT > 250) {
       this._occT = time;
       let occluded = false;
@@ -274,7 +326,7 @@ AFRAME.registerComponent('rf-emitter', {
         this._occRay.far = dist - 0.05;
         occluded = this._occRay.intersectObjects(occ.group.children, false).length > 0;
       }
-      this.ghost.visible = occluded;
+      this.ghost.visible = occluded || this._statusLost;
     }
     this.shell.rotation.y += step * (this.focused ? 1.1 : 0.35);
     this.shell.rotation.x += step * 0.15;
